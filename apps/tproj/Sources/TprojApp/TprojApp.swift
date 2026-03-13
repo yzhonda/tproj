@@ -25,6 +25,7 @@ private extension Color {
 private struct GhosttyWindowInfo {
     let frame: NSRect
     let windowNumber: Int
+    let windowLevel: Int
 }
 
 struct GhosttyTheme {
@@ -192,7 +193,7 @@ private func currentGhosttyWindowInfo() -> GhosttyWindowInfo? {
         guard let name = info[kCGWindowOwnerName as String] as? String,
               name == "Ghostty",
               let layer = info[kCGWindowLayer as String] as? Int,
-              layer == 0,   // normal windows only (skip menu bar, popups)
+              layer >= 0,   // normal windows (0) + fullscreen (may elevate)
               let number = info[kCGWindowNumber as String] as? Int,
               let bounds = info[kCGWindowBounds as String] as? [String: NSNumber],
               let x = bounds["X"],
@@ -209,7 +210,8 @@ private func currentGhosttyWindowInfo() -> GhosttyWindowInfo? {
         let cocoaY = screenHeight - cgY - cgH
         return GhosttyWindowInfo(
             frame: NSRect(x: cgX, y: cocoaY, width: cgW, height: cgH),
-            windowNumber: number
+            windowNumber: number,
+            windowLevel: layer
         )
     }
     return nil
@@ -437,6 +439,7 @@ final class PaneBackgroundUnderlayController: ObservableObject {
         )
 
         let window = ensureUnderlayWindow()
+        window.level = NSWindow.Level(rawValue: ghosttyInfo.windowLevel)
         window.setFrame(ghosttyInfo.frame, display: true)
         updateContent(of: window, manifest: filteredManifest)
         window.order(.below, relativeTo: ghosttyInfo.windowNumber)
