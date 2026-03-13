@@ -428,22 +428,22 @@ _tproj_gui_running() {
 # GUI App パス正規化（.app か Contents/MacOS/tproj のどちらでも受け取る）
 _normalize_gui_app_path() {
   local raw="$1"
-  local path
+  local app_path
   [[ -z "$raw" ]] && return 1
 
-  path="$raw"
-  if [[ "$path" == "~/"* ]]; then
-    path="$HOME/${path#~/}"
+  app_path="$raw"
+  if [[ "$app_path" == "~/"* ]]; then
+    app_path="$HOME/${app_path#~/}"
   fi
-  [[ -z "$path" || "$path" == "null" ]] && return 1
+  [[ -z "$app_path" || "$app_path" == "null" ]] && return 1
 
-  if [[ "$path" == *.app/Contents/MacOS/* ]]; then
-    path="${path%%.app/Contents/MacOS/*}.app"
+  if [[ "$app_path" == *.app/Contents/MacOS/* ]]; then
+    app_path="${app_path%%.app/Contents/MacOS/*}.app"
   fi
-  [[ "$path" == *.app ]] || return 1
-  [[ -d "$path" ]] || return 1
+  [[ "$app_path" == *.app ]] || return 1
+  [[ -d "$app_path" ]] || return 1
 
-  echo "$path"
+  echo "$app_path"
 }
 
 _read_workspace_gui_app_path() {
@@ -510,16 +510,16 @@ _find_gui_target() {
 # TprojApp GUI を起動/再表示
 launch_tproj_gui() {
   [[ "$NO_GUI" == "true" ]] && return 0
-  local target kind path
+  local target kind gui_path
   target="$(_find_gui_target 2>/dev/null)" || return 0
   kind="${target%%|*}"
-  path="${target#*|}"
-  [[ -z "$path" ]] && return 0
+  gui_path="${target#*|}"
+  [[ -z "$gui_path" ]] && return 0
 
   if _tproj_gui_running; then
     if [[ "$kind" == "app" ]]; then
       # 既存プロセスがいる場合も再表示する
-      open -a "$path" >/dev/null 2>&1 \
+      open -a "$gui_path" >/dev/null 2>&1 \
         || osascript -e 'tell application id "com.usedhonda.tproj.desktop" to activate' >/dev/null 2>&1 \
         || true
     fi
@@ -534,9 +534,9 @@ launch_tproj_gui() {
 
   if [[ "$kind" == "app" ]]; then
     # 初回は背景起動（Terminal に "Last login ...; exit" を出さない）
-    open -g "$path" >/dev/null 2>&1 || true
+    open -g "$gui_path" >/dev/null 2>&1 || true
   elif [[ "$kind" == "bin" ]]; then
-    "$path" &
+    "$gui_path" &
     disown
   fi
 }
