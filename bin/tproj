@@ -420,125 +420,77 @@ collect_session_descendants() {
   collect_descendant_pids "${pane_pids_arr[@]}"
 }
 
-# GUI プロセス検出（.app と開発版直起動の両方を検出）
-_tproj_gui_running() {
-  pgrep -f '\.build/.*/tproj$|tproj\.app/' >/dev/null 2>&1
-}
+# PID file for GUI process coordination (shared with dev-app.sh)
+TPROJ_GUI_PIDFILE="${TMPDIR:-/tmp}/tproj-gui.pid"
 
-# GUI App パス正規化（.app か Contents/MacOS/tproj のどちらでも受け取る）
-_normalize_gui_app_path() {
-  local raw="$1"
-  local app_path
-  [[ -z "$raw" ]] && return 1
-
-  app_path="$raw"
-  if [[ "$app_path" == "~/"* ]]; then
-    app_path="$HOME/${app_path#~/}"
-  fi
-  [[ -z "$app_path" || "$app_path" == "null" ]] && return 1
-
-  if [[ "$app_path" == *.app/Contents/MacOS/* ]]; then
-    app_path="${app_path%%.app/Contents/MacOS/*}.app"
-  fi
-  [[ "$app_path" == *.app ]] || return 1
-  [[ -d "$app_path" ]] || return 1
-
-  echo "$app_path"
-}
-
-_read_workspace_gui_app_path() {
-  local ws_config="$HOME/.config/tproj/workspace.yaml"
-  [[ -f "$ws_config" ]] || return 1
-  command -v yq >/dev/null 2>&1 || return 1
-
-  local raw
-  raw=$(yq -r '.gui.app_path // ""' "$ws_config" 2>/dev/null || true)
-  [[ -z "$raw" || "$raw" == "null" ]] && return 1
-
-  _normalize_gui_app_path "$raw"
-}
-
-# GUI 起動ターゲット選択
+# GUI 起動ターゲット選択（3段階）
 # 優先順位:
-#   1) TPROJ_GUI_APP_PATH 環境変数
-#   2) debug バイナリ (.build/arm64-apple-macosx/debug/tproj) — 開発優先
-#   3) ~/.config/tproj/workspace.yaml の gui.app_path
-#   4) tproj workspace 内の apps/tproj/dist/tproj.app
-#   5) 現在プロジェクト root の apps/tproj/dist/tproj.app
-#   6) 配布版の標準配置（~/Applications, /Applications）
-#
-# 返り値フォーマット:
-#   app|/path/to/tproj.app  または  bin|/path/to/tproj
+#   1) TPROJ_GUI_APP_PATH 環境変数（明示的オーバーライド）
+#   2) debug バイナリ (.build/arm64-apple-macosx/debug/tproj) — 開発用（通常はこれ）
+#   3) dist/tproj.app — 配布用フォールバック
 _find_gui_target() {
-  local p app configured
+  local p gui_bin
 
-  configured="${TPROJ_GUI_APP_PATH:-}"
-  if [[ -n "$configured" ]]; then
-    app="$(_normalize_gui_app_path "$configured" 2>/dev/null)" \
-      && { echo "app|$app"; return 0; }
+  # (1) 環境変数による明示的オーバーライド
+  if [[ -n "${TPROJ_GUI_APP_PATH:-}" && -x "${TPROJ_GUI_APP_PATH}" ]]; then
+    echo "$TPROJ_GUI_APP_PATH"
+    return 0
   fi
 
   # (2) debug バイナリ（開発時は常にこちらを優先）
-  local debug_bin
   for p in "${PROJECT_PATHS[@]}" "$root"; do
-    debug_bin="$p/apps/tproj/.build/arm64-apple-macosx/debug/tproj"
-    [[ -x "$debug_bin" ]] && { echo "bin|$debug_bin"; return 0; }
+    gui_bin="$p/apps/tproj/.build/arm64-apple-macosx/debug/tproj"
+    [[ -x "$gui_bin" ]] && { echo "$gui_bin"; return 0; }
   done
 
-  # (3) workspace.yaml gui.app_path
-  app="$(_read_workspace_gui_app_path 2>/dev/null)" \
-    && { echo "app|$app"; return 0; }
-
-  # (4) workspace 内 dist app bundle
-  for p in "${PROJECT_PATHS[@]}"; do
-    app="$p/apps/tproj/dist/tproj.app"
-    [[ -d "$app" ]] && { echo "app|$app"; return 0; }
-  done
-
-  # (5) current root dist
-  app="$root/apps/tproj/dist/tproj.app"
-  [[ -d "$app" ]] && { echo "app|$app"; return 0; }
-
-  # (6) 標準配置
-  for app in "$HOME/Applications/tproj.app" "/Applications/tproj.app"; do
-    [[ -d "$app" ]] && { echo "app|$app"; return 0; }
+  # (3) dist app bundle（Contents/MacOS/tproj を直接実行）
+  for p in "${PROJECT_PATHS[@]}" "$root"; do
+    gui_bin="$p/apps/tproj/dist/tproj.app/Contents/MacOS/tproj"
+    [[ -x "$gui_bin" ]] && { echo "$gui_bin"; return 0; }
   done
 
   return 1
 }
 
-# TprojApp GUI を起動/再表示
-launch_tproj_gui() {
-  [[ "$NO_GUI" == "true" ]] && return 0
-  local target kind gui_path
-  target="$(_find_gui_target 2>/dev/null)" || return 0
-  kind="${target%%|*}"
-  gui_path="${target#*|}"
-  [[ -z "$gui_path" ]] && return 0
-
-  if _tproj_gui_running; then
-    if [[ "$kind" == "app" ]]; then
-      # 既存プロセスがいる場合も再表示する
-      open -a "$gui_path" >/dev/null 2>&1 \
-        || osascript -e 'tell application id "com.usedhonda.tproj.desktop" to activate' >/dev/null 2>&1 \
-        || true
-    fi
-    # debug バイナリが既に動いている場合は何もしない（常に表示されている）
-    return 0
+# 全 GUI プロセスを確実に停止
+_tproj_gui_kill_all() {
+  # PID file で正確に殺す
+  if [[ -f "$TPROJ_GUI_PIDFILE" ]]; then
+    kill "$(<"$TPROJ_GUI_PIDFILE")" 2>/dev/null || true
+    rm -f "$TPROJ_GUI_PIDFILE"
   fi
-
-  # 起動前に全 GUI プロセスを kill（二重起動防止）
-  # パターンは dev-app.sh L26 と同一
+  # パターンで残党掃討
   pkill -f 'apps/tproj/dist/tproj.app/Contents/MacOS/tproj|\.build/.*/tproj$|tproj-gui' 2>/dev/null || true
   sleep 0.3
+}
 
-  if [[ "$kind" == "app" ]]; then
-    # 初回は背景起動（Terminal に "Last login ...; exit" を出さない）
-    open -g "$gui_path" >/dev/null 2>&1 || true
-  elif [[ "$kind" == "bin" ]]; then
-    "$gui_path" &
-    disown
+# TprojApp GUI を起動（kill-then-launch 方式）
+launch_tproj_gui() {
+  [[ "$NO_GUI" == "true" ]] && return 0
+
+  local gui_path
+  gui_path="$(_find_gui_target 2>/dev/null)" || return 0
+  [[ -z "$gui_path" ]] && return 0
+
+  # PID file あり && PID 生存 && 同じバイナリ → 既に正しいのが動いてる
+  if [[ -f "$TPROJ_GUI_PIDFILE" ]]; then
+    local existing_pid
+    existing_pid="$(<"$TPROJ_GUI_PIDFILE")"
+    if kill -0 "$existing_pid" 2>/dev/null; then
+      local existing_bin
+      existing_bin="$(ps -p "$existing_pid" -o comm= 2>/dev/null || true)"
+      if [[ -n "$existing_bin" ]]; then
+        return 0
+      fi
+    fi
   fi
+
+  # 全プロセス停止してから起動
+  _tproj_gui_kill_all
+
+  "$gui_path" &
+  disown
+  echo "$!" > "$TPROJ_GUI_PIDFILE"
 }
 
 # レイアウト確定後フック（private 拡張用）
@@ -643,13 +595,23 @@ cleanup_orphaned_mcp() {
 }
 
 # Kill surviving descendant processes after session termination
+# Phase 1: SIGTERM, Phase 2: wait 2s, Phase 3: SIGKILL survivors
 kill_surviving_descendants() {
   local desc_pids="$1"
   [[ -z "$desc_pids" ]] && return 0
+  # Phase 1: SIGTERM
   while IFS= read -r pid; do
     [[ -z "$pid" ]] && continue
-    # Only kill if still running
     kill -0 "$pid" 2>/dev/null && kill -TERM "$pid" 2>/dev/null || true
+  done <<< "$desc_pids"
+  # Phase 2: Wait for graceful shutdown
+  sleep 2
+  # Phase 3: SIGKILL survivors
+  while IFS= read -r pid; do
+    [[ -z "$pid" ]] && continue
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -9 "$pid" 2>/dev/null || true
+    fi
   done <<< "$desc_pids"
 }
 
@@ -808,11 +770,6 @@ add_workspace_column() {
     echo "Error: failed to acquire layout lock" >&2
     exit 1
   }
-
-  if [[ -z "${TMUX:-}" ]]; then
-    echo "Error: --add must be run inside tmux" >&2
-    exit 1
-  fi
 
   tmux has-session -t "$session" 2>/dev/null || {
     echo "Error: $session is not running" >&2
@@ -1167,11 +1124,15 @@ install_pane_focus_hook() {
   tmux set-hook -t "$session" after-select-pane \
     "run-shell '$hook_path #{session_name} #{pane_id}'" 2>/dev/null || true
 
-  # Install pane-died hook: respawn CC/Cdx panes whose shell has exited
+  # Install pane-died hook: respawn CC/Cdx panes via respawn-guard (circuit breaker)
   # Only respawn if @role matches claude* or codex*; other panes are left alone.
+  local respawn_guard="$HOME/bin/tproj-respawn-guard"
+  [[ ! -x "$respawn_guard" ]] && respawn_guard="$SCRIPT_DIR/tproj-respawn-guard"
   tmux set-hook -t "$session" pane-died \
-    "if-shell -F '#{m:claude*,#{@role}}' 'respawn-pane -t #{pane_id}' \
-     'if-shell -F \"#{m:codex*,#{@role}}\" \"respawn-pane -t #{pane_id}\"'" 2>/dev/null || true
+    "if-shell -F '#{m:claude*,#{@role}}' \
+       'run-shell \"$respawn_guard #{session_name} #{pane_id} #{@role}\"' \
+     'if-shell -F \"#{m:codex*,#{@role}}\" \
+       \"run-shell \\\"$respawn_guard #{session_name} #{pane_id} #{@role}\\\"\"'" 2>/dev/null || true
 }
 
 repair_workspace_tags() {
@@ -1616,6 +1577,7 @@ create_workspace_layout() {
   # 全ての Claude ペインを先に横に作成
   declare -a claude_panes
   declare -a codex_panes
+  local codex_title claude_title
 
   # 最初のプロジェクトのディレクトリ（ローカル優先、なければ /tmp）
   local first_dir="${paths[0]}"
@@ -1682,7 +1644,6 @@ create_workspace_layout() {
     tmux set-option -pt "$claude_pane" remain-on-exit on 2>/dev/null || true
 
     # ペインタイトル設定
-    local codex_title claude_title
     codex_title="$(build_pane_label "$proj_type" "$proj_host" "$proj_path" "Codex" "${aliases[$((i-1))]}")"
     claude_title="$(build_pane_label "$proj_type" "$proj_host" "$proj_path" "CC" "${aliases[$((i-1))]}")"
     # Claude が OSC タイトルで pane_title を上書きするため固定化
@@ -2025,13 +1986,7 @@ if [[ "$WORKSPACE_MODE" == "true" ]]; then
     tmux select-pane -t "$session:dev.1"
 fi
 
-# Start watchdog daemon for auto-restart of crashed CC/Cdx
-if [[ -x "$HOME/bin/tproj-pane-watchdog" ]]; then
-  "$HOME/bin/tproj-pane-watchdog" "$session" &
-  disown
-elif [[ -x "$SCRIPT_DIR/tproj-pane-watchdog" ]]; then
-  "$SCRIPT_DIR/tproj-pane-watchdog" "$session" &
-  disown
-fi
+# Pane auto-restart is handled by pane-died hook + tproj-respawn-guard (circuit breaker).
+# Legacy tproj-pane-watchdog is disabled (requires bash 4+ declare -A, macOS ships bash 3.2).
 
 exec tmux attach -t "$session"
