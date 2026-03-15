@@ -452,7 +452,6 @@ final class PaneBackgroundUnderlayController: ObservableObject {
         updateContent(of: window, manifest: filteredManifest)
         window.order(.below, relativeTo: ghosttyInfo.windowNumber)
         lastGhosttyWindowNumber = ghosttyInfo.windowNumber
-
     }
 
     private func loadManifest() -> PaneBackgroundManifest? {
