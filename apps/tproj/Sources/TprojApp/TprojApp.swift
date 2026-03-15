@@ -191,13 +191,8 @@ private func currentGhosttyWindowInfo() -> GhosttyWindowInfo? {
     for info in list {
         guard let name = info[kCGWindowOwnerName as String] as? String,
               name == "Ghostty",
-              let layer = info[kCGWindowLayer as String] as? Int else {
-            continue
-        }
-        // Diagnostic: log all Ghostty windows and their layers
-        NSLog("[tproj-underlay] ghostty-scan: layer=%d", layer)
-
-        guard layer == 0,   // normal windows only (skip menu bar, popups)
+              let layer = info[kCGWindowLayer as String] as? Int,
+              layer == 0,   // normal windows only (skip menu bar, popups)
               let number = info[kCGWindowNumber as String] as? Int,
               let bounds = info[kCGWindowBounds as String] as? [String: NSNumber],
               let x = bounds["X"],
@@ -419,6 +414,17 @@ final class PaneBackgroundUnderlayController: ObservableObject {
             return
         }
 
+        // macOS fullscreen creates an isolated Space where underlay windows
+        // cannot appear behind the fullscreen app. Hide gracefully.
+        let isFullscreen = NSScreen.screens.contains { screen in
+            abs(ghosttyInfo.frame.width - screen.frame.width) < 2 &&
+            abs(ghosttyInfo.frame.height - screen.frame.height) < 2
+        }
+        if isFullscreen {
+            hideUnderlay()
+            return
+        }
+
         guard let manifest = loadManifest(),
               manifest.windowCells.width > 0,
               manifest.windowCells.height > 0 else {
@@ -447,11 +453,6 @@ final class PaneBackgroundUnderlayController: ObservableObject {
         window.order(.below, relativeTo: ghosttyInfo.windowNumber)
         lastGhosttyWindowNumber = ghosttyInfo.windowNumber
 
-        // Diagnostic: log underlay state for fullscreen debugging
-        NSLog("[tproj-underlay] tick: ghostty=#%d onActiveSpace=%d level=%d",
-              ghosttyInfo.windowNumber,
-              window.isOnActiveSpace ? 1 : 0,
-              window.level.rawValue)
     }
 
     private func loadManifest() -> PaneBackgroundManifest? {
@@ -494,7 +495,7 @@ final class PaneBackgroundUnderlayController: ObservableObject {
         window.hasShadow = false
         window.ignoresMouseEvents = true
         window.level = .normal
-        window.collectionBehavior = [.canJoinAllSpaces, .ignoresCycle, .fullScreenAuxiliary]
+        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         underlayWindow = window
         return window
     }
