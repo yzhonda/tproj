@@ -37,19 +37,21 @@ if [[ "$MODE" == "debug" ]]; then
   "$DEBUG_BIN" &
   echo "$!" > "$TPROJ_GUI_PIDFILE"
   sleep 1
-  if ! pgrep -f '\.build/.*/tproj$' >/dev/null 2>&1; then
-    echo "debug process not detected; check build output" >&2
+  local_pid="$(<"$TPROJ_GUI_PIDFILE")"
+  if ! kill -0 "$local_pid" 2>/dev/null; then
+    echo "debug process (pid $local_pid) not detected; check build output" >&2
     exit 1
   fi
-  echo "Done: $DEBUG_BIN (pid $(pgrep -f '\.build/.*/tproj$'))"
+  echo "Done: $DEBUG_BIN (pid $local_pid)"
 else
   echo "==> Launch app (release)"
   "$APP_BUNDLE/Contents/MacOS/tproj" &
   echo "$!" > "$TPROJ_GUI_PIDFILE"
   sleep 1
-  if ! pgrep -f 'apps/tproj/dist/tproj.app/Contents/MacOS/tproj' >/dev/null 2>&1; then
-    echo "app process not detected; check build output" >&2
+  local_pid="$(<"$TPROJ_GUI_PIDFILE")"
+  if ! kill -0 "$local_pid" 2>/dev/null; then
+    echo "app process (pid $local_pid) not detected; check build output" >&2
     exit 1
   fi
-  echo "Done: $APP_BUNDLE (pid $(pgrep -f 'apps/tproj/dist/tproj.app/Contents/MacOS/tproj'))"
+  echo "Done: $APP_BUNDLE (pid $local_pid)"
 fi

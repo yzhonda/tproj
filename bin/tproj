@@ -577,7 +577,7 @@ stop_tproj_gui_if_needed() {
   fi
 
   if [[ "$keep_alive" != "true" ]]; then
-    pkill -f '\.build/.*/tproj$|tproj\.app/' 2>/dev/null || true
+    _tproj_gui_kill_all
   fi
 }
 
