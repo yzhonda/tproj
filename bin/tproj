@@ -423,11 +423,11 @@ collect_session_descendants() {
 # PID file for GUI process coordination (shared with dev-app.sh)
 TPROJ_GUI_PIDFILE="${TMPDIR:-/tmp}/tproj-gui.pid"
 
-# GUI 起動ターゲット選択（3段階）
+# GUI 起動ターゲット選択
 # 優先順位:
 #   1) TPROJ_GUI_APP_PATH 環境変数（明示的オーバーライド）
-#   2) debug バイナリ (.build/arm64-apple-macosx/debug/tproj) — 開発用（通常はこれ）
-#   3) dist/tproj.app — 配布用フォールバック
+#   2) gui.app_path in workspace.yaml（yaml で指定した場合）
+#   3) debug バイナリ auto-detect (.build/.../debug/tproj)
 _find_gui_target() {
   local p gui_bin
 
@@ -437,18 +437,13 @@ _find_gui_target() {
     return 0
   fi
 
-  # (2) debug バイナリ（開発時は常にこちらを優先）
-  for p in "${PROJECT_PATHS[@]}" "$root"; do
+  # (2) debug バイナリ（enabled + disabled 全プロジェクト + root を検索）
+  for p in "${PROJECT_PATHS[@]}" "${CATALOG_PATHS[@]}" "$root"; do
     gui_bin="$p/apps/tproj/.build/arm64-apple-macosx/debug/tproj"
     [[ -x "$gui_bin" ]] && { echo "$gui_bin"; return 0; }
   done
 
-  # (3) dist app bundle（Contents/MacOS/tproj を直接実行）
-  for p in "${PROJECT_PATHS[@]}" "$root"; do
-    gui_bin="$p/apps/tproj/dist/tproj.app/Contents/MacOS/tproj"
-    [[ -x "$gui_bin" ]] && { echo "$gui_bin"; return 0; }
-  done
-
+  # dist 版は自動起動しない。必要なら TPROJ_GUI_APP_PATH で明示指定
   return 1
 }
 
@@ -460,7 +455,7 @@ _tproj_gui_kill_all() {
     rm -f "$TPROJ_GUI_PIDFILE"
   fi
   # パターンで残党掃討
-  pkill -f 'apps/tproj/dist/tproj.app/Contents/MacOS/tproj|\.build/.*/tproj$|tproj-gui' 2>/dev/null || true
+  pkill -f 'apps/tproj/dist/tproj.app/Contents/MacOS/tproj|\.build/.*/debug/tproj|tproj-gui' 2>/dev/null || true
   sleep 0.3
 }
 
@@ -477,9 +472,9 @@ launch_tproj_gui() {
     local existing_pid
     existing_pid="$(<"$TPROJ_GUI_PIDFILE")"
     if kill -0 "$existing_pid" 2>/dev/null; then
-      local existing_bin
-      existing_bin="$(ps -p "$existing_pid" -o comm= 2>/dev/null || true)"
-      if [[ -n "$existing_bin" ]]; then
+      local existing_args
+      existing_args="$(ps -p "$existing_pid" -o args= 2>/dev/null || true)"
+      if [[ "$existing_args" == "$gui_path" ]]; then
         return 0
       fi
     fi
@@ -886,6 +881,9 @@ add_workspace_column() {
   run_rebalance_workspace "$session"
   sleep 0.15
 
+  # Add 時は npm update をスキップ（既存セッションで CC/Cdx は更新済み前提）
+  NO_UPDATE=true
+
   local claude_cmd codex_cmd include_cd="true"
   [[ "$src_type" == "remote" ]] && include_cd="false"
   claude_cmd="$(build_claude_launch_shell "$src_path" "$src_type" "$include_cd")"
@@ -1015,6 +1013,13 @@ parse_global_workspace_config() {
 
   load_workspace_string_array '.launch.claude.args' 'launch.claude.args' GLOBAL_CLAUDE_ARGS
   load_workspace_string_array '.launch.codex.args' 'launch.codex.args' GLOBAL_CODEX_ARGS
+
+  # GUI app path from workspace.yaml (env var takes precedence)
+  local yaml_app_path
+  yaml_app_path="$(read_workspace_string_setting '.gui.app_path' '' 'gui.app_path')"
+  if [[ -n "$yaml_app_path" && -z "${TPROJ_GUI_APP_PATH:-}" ]]; then
+    TPROJ_GUI_APP_PATH="$yaml_app_path"
+  fi
 
   TMUX_UI_PANE_BORDER_ACTIVE_FG="$(read_workspace_string_setting '.tmux_ui.pane_border.active_fg' "$TMUX_UI_PANE_BORDER_ACTIVE_FG" 'tmux_ui.pane_border.active_fg')"
   TMUX_UI_PANE_BORDER_ACTIVE_BOLD="$(read_workspace_bool_setting '.tmux_ui.pane_border.active_bold' "$TMUX_UI_PANE_BORDER_ACTIVE_BOLD" 'tmux_ui.pane_border.active_bold')"
@@ -1824,18 +1829,15 @@ start_workspace_tools() {
     done
   fi
 
-  # Start all Codex panes
+  # Start panes per column (staggered to avoid memory spike from concurrent npm updates)
   for i in $(seq 1 $num_projects); do
     start_codex_for_column "$session" "$no_update" "$i" \
       "${paths[$((i-1))]}" "${types[$((i-1))]}" "${hosts[$((i-1))]}" "${cdx_launches[$((i-1))]:-true}"
-    sleep 0.2
-  done
-
-  # Start all Claude panes
-  for i in $(seq 1 $num_projects); do
+    sleep 0.5
     start_claude_for_column "$session" "$no_update" "$i" \
       "${paths[$((i-1))]}" "${types[$((i-1))]}" "${hosts[$((i-1))]}" "${cc_launches[$((i-1))]:-true}"
-    sleep 0.2
+    # Wait for npm update to settle before starting next column
+    [[ $i -lt $num_projects ]] && sleep 2
   done
 
   # 最初の Claude ペインを選択
