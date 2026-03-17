@@ -418,7 +418,7 @@ final class PaneBackgroundUnderlayController: ObservableObject {
         // cannot appear behind the fullscreen app. Hide gracefully.
         let isFullscreen = NSScreen.screens.contains { screen in
             abs(ghosttyInfo.frame.width - screen.frame.width) < 2 &&
-            abs(ghosttyInfo.frame.height - screen.frame.height) < 2
+            ghosttyInfo.frame.height >= screen.frame.height * 0.95
         }
         if isFullscreen {
             hideUnderlay()
@@ -1904,6 +1904,16 @@ final class AppViewModel: ObservableObject {
             memoryLastUpdatedAt = Date()
             memoryErrorText = snapshot.collector.errors.isEmpty ? nil : snapshot.collector.errors[0]
             persistMonitorStatus(snapshot)
+
+            // Auto-kill: if available memory < 1GB, drop newest column to prevent kernel panic
+            let availMB = Self.availableMemoryMB()
+            if availMB < 1024 {
+                let cols = liveColumns.sorted(by: { $0.column < $1.column })
+                if cols.count > 1, let newest = cols.last {
+                    statusText = "Memory critical (\(availMB)MB available) - auto-removing column \(newest.column)"
+                    await removeColumn(newest)
+                }
+            }
         } catch {
             let message = "Monitor decode failed: \(error.localizedDescription)"
             memoryErrorText = message
@@ -2163,7 +2173,29 @@ final class AppViewModel: ObservableObject {
         await addColumnByAlias(selectedAlias)
     }
 
+    /// Available memory in MB (free + inactive + purgeable).
+    /// macOS keeps "free" artificially low due to aggressive caching, so we include reclaimable pages.
+    private nonisolated static func availableMemoryMB() -> Int {
+        var info = vm_statistics64()
+        var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64>.size / MemoryLayout<integer_t>.size)
+        let result = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return Int.max }  // fail-open: don't block on error
+        let pageSize = UInt64(vm_kernel_page_size)
+        let availBytes = (UInt64(info.free_count) + UInt64(info.inactive_count) + UInt64(info.purgeable_count)) * pageSize
+        return Int(availBytes / (1024 * 1024))
+    }
+
     func addColumnByAlias(_ alias: String) async {
+        // Memory gate: refuse if available memory < 2GB (CC + Cdx need ~1.5GB)
+        let availMB = Self.availableMemoryMB()
+        if availMB < 2048 {
+            statusText = "Memory too low (\(availMB)MB available) - close apps or remove columns first"
+            return
+        }
         guard beginLayoutMutation(action: "add-column") else { return }
         let startedMS = Int64(Date().timeIntervalSince1970 * 1000)
         let beforeCount = await workspacePaneCountAsync()
@@ -2263,36 +2295,23 @@ final class AppViewModel: ObservableObject {
         }
         lockHeld = true
 
-        let exitCmd: String
         let paneIDs: [String]
         let roleName: String
         switch role {
         case "claude":
             paneIDs = column.claudePaneIDs
-            exitCmd = "exit"
             roleName = "claude-p\(column.column)"
         case "codex":
             paneIDs = column.codexPaneIDs
-            exitCmd = "/exit"
             roleName = "codex-p\(column.column)"
         default: return
         }
 
-        // Toggle off: graceful stop + kill-pane
+        // Toggle off: graceful exit + descendant cleanup via shared script
         if !paneIDs.isEmpty {
             for paneID in paneIDs {
-                _ = await runCommandAsync("/usr/bin/env",
-                    ["tmux", "send-keys", "-t", paneID, "C-c", ""])
-            }
-            try? await Task.sleep(nanoseconds: 300_000_000)
-            for paneID in paneIDs {
-                _ = await runCommandAsync("/usr/bin/env",
-                    ["tmux", "send-keys", "-t", paneID, exitCmd, "Enter"])
-            }
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
-            for paneID in paneIDs {
-                _ = await runCommandAsync("/usr/bin/env",
-                    ["tmux", "kill-pane", "-t", paneID])
+                _ = await runCommandAsync("\(NSHomeDirectory())/bin/tproj-kill-pane",
+                    [paneID, roleName])
             }
             note += " state=off"
             statusText = "\(role) off for #\(column.column)"
@@ -2457,9 +2476,10 @@ final class AppViewModel: ObservableObject {
                 return (id: parts[0], role: parts[1])
             }
 
-        // Toggle off: kill existing terminal
+        // Toggle off: graceful exit + descendant cleanup via shared script
         if let existing = paneRoles.first(where: { $0.role == roleName }) {
-            let killResult = await runCommandAsync("/usr/bin/env", ["tmux", "kill-pane", "-t", existing.id])
+            let killResult = await runCommandAsync("\(NSHomeDirectory())/bin/tproj-kill-pane",
+                [existing.id, roleName])
             if killResult.exitCode != 0 {
                 resultTag = "error"
                 note += " off_error=\(trimmedError(killResult))"
@@ -3632,10 +3652,34 @@ final class AppViewModel: ObservableObject {
 
         do {
             try process.run()
-            process.waitUntilExit()
 
-            let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            // Read both pipes concurrently to avoid deadlock when pipe buffer (64KB) fills.
+            // If we read sequentially or after waitUntilExit, the child can block on write.
+            let maxBuffer = 65536
+            var outData = Data()
+            var errData = Data()
+
+            let group = DispatchGroup()
+
+            group.enter()
+            DispatchQueue.global(qos: .utility).async {
+                let d = outPipe.fileHandleForReading.readDataToEndOfFile()
+                outData = d.count > maxBuffer ? d.prefix(maxBuffer) : d
+                group.leave()
+            }
+
+            group.enter()
+            DispatchQueue.global(qos: .utility).async {
+                let d = errPipe.fileHandleForReading.readDataToEndOfFile()
+                errData = d.count > maxBuffer ? d.prefix(maxBuffer) : d
+                group.leave()
+            }
+
+            process.waitUntilExit()
+            group.wait()
+
+            let out = String(data: outData, encoding: .utf8) ?? ""
+            let err = String(data: errData, encoding: .utf8) ?? ""
 
             return CommandResult(exitCode: process.terminationStatus, stdout: out, stderr: err)
         } catch {
