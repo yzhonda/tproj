@@ -1,0 +1,125 @@
+#!/bin/bash
+# tproj-postmortem - Post-death forensics for killed processes
+# Usage: some_command; tproj-postmortem $? "some_command"
+#
+# Displays a formatted report when a process is killed by a signal.
+# Checks memory-guard kill markers, system memory, and logs the event.
+set -uo pipefail
+
+EXIT_CODE="${1:-0}"
+PROC_NAME="${2:-unknown}"
+LOG="/tmp/tproj-postmortem.log"
+KILL_MARKER_DIR="/tmp/memory-guard-kills"
+
+# Normal exit or no signal - nothing to report
+[[ "$EXIT_CODE" -le 128 ]] && exit 0
+
+SIGNAL=$((EXIT_CODE - 128))
+
+# Map signal numbers to names
+signal_name() {
+  case "$1" in
+    1) echo "SIGHUP" ;;
+    2) echo "SIGINT" ;;
+    3) echo "SIGQUIT" ;;
+    6) echo "SIGABRT" ;;
+    9) echo "SIGKILL" ;;
+    11) echo "SIGSEGV" ;;
+    13) echo "SIGPIPE" ;;
+    14) echo "SIGALRM" ;;
+    15) echo "SIGTERM" ;;
+    *) echo "SIG$1" ;;
+  esac
+}
+
+SIG_NAME=$(signal_name "$SIGNAL")
+TS=$(date '+%Y-%m-%d %H:%M:%S')
+
+# --- Forensics ---
+
+cause="unknown"
+detail=""
+
+# (1) Check memory-guard kill markers (last 30 seconds)
+if [[ -d "$KILL_MARKER_DIR" ]]; then
+  recent_marker=$(find "$KILL_MARKER_DIR" -type f -mmin -1 -newer /dev/null 2>/dev/null | head -1)
+  if [[ -n "$recent_marker" ]]; then
+    marker_content=$(cat "$recent_marker" 2>/dev/null || true)
+    if echo "$marker_content" | grep -q "claude\|$PROC_NAME"; then
+      reason=$(echo "$marker_content" | grep -o '"reason":"[^"]*"' | cut -d'"' -f4)
+      rss=$(echo "$marker_content" | grep -o '"rss_mb":[0-9]*' | cut -d: -f2)
+      cause="memory-guard ($reason)"
+      detail="RSS: ${rss}MB at time of kill"
+    fi
+  fi
+fi
+
+# (2) Check system memory pressure
+if [[ "$cause" == "unknown" ]]; then
+  vm_out=$(vm_stat 2>/dev/null)
+  page_size=$(sysctl -n vm.pagesize 2>/dev/null || echo 16384)
+  free_p=$(echo "$vm_out" | awk '/Pages free/ {gsub(/\./,"",$3); print $3}')
+  inactive_p=$(echo "$vm_out" | awk '/Pages inactive/ {gsub(/\./,"",$3); print $3}')
+  purgeable_p=$(echo "$vm_out" | awk '/Pages purgeable/ {gsub(/\./,"",$3); print $3}')
+  avail_mb=$(( (${free_p:-0} + ${inactive_p:-0} + ${purgeable_p:-0}) * page_size / 1048576 ))
+
+  if [[ "$avail_mb" -lt 512 && "$SIG_NAME" == "SIGKILL" ]]; then
+    cause="likely macOS jetsam (OOM)"
+    detail="Available memory: ${avail_mb}MB at death"
+  fi
+fi
+
+# (3) Check memory-guard log for recent entries
+if [[ "$cause" == "unknown" && -f /tmp/memory-guard.log ]]; then
+  recent_log=$(tail -5 /tmp/memory-guard.log 2>/dev/null | grep -i "kill\|orphan\|runaway" | tail -1)
+  if [[ -n "$recent_log" ]]; then
+    cause="memory-guard (from log)"
+    detail="$recent_log"
+  fi
+fi
+
+# (4) If SIGKILL with no identified source
+if [[ "$cause" == "unknown" && "$SIG_NAME" == "SIGKILL" ]]; then
+  # Get current memory snapshot for context
+  vm_out=${vm_out:-$(vm_stat 2>/dev/null)}
+  page_size=${page_size:-$(sysctl -n vm.pagesize 2>/dev/null || echo 16384)}
+  free_p=${free_p:-$(echo "$vm_out" | awk '/Pages free/ {gsub(/\./,"",$3); print $3}')}
+  inactive_p=${inactive_p:-$(echo "$vm_out" | awk '/Pages inactive/ {gsub(/\./,"",$3); print $3}')}
+  purgeable_p=${purgeable_p:-$(echo "$vm_out" | awk '/Pages purgeable/ {gsub(/\./,"",$3); print $3}')}
+  avail_mb=$(( (${free_p:-0} + ${inactive_p:-0} + ${purgeable_p:-0}) * page_size / 1048576 ))
+
+  total_claude_mb=$(ps -eo rss,comm 2>/dev/null | awk '/claude/ {sum+=$1} END {printf "%.0f", sum/1024}')
+
+  cause="unidentified external kill"
+  detail="Available mem: ${avail_mb}MB, Total claude RSS: ${total_claude_mb:-?}MB"
+fi
+
+# --- Display report ---
+
+echo ""
+echo "============================================"
+echo "  PROCESS DEATH REPORT"
+echo "============================================"
+echo "  Time:    $TS"
+echo "  Process: $PROC_NAME"
+echo "  Signal:  $SIG_NAME (exit code $EXIT_CODE)"
+echo "  Cause:   $cause"
+[[ -n "$detail" ]] && echo "  Detail:  $detail"
+echo "============================================"
+echo ""
+
+# --- Log to file ---
+
+{
+  echo "---"
+  echo "ts: $TS"
+  echo "process: $PROC_NAME"
+  echo "signal: $SIG_NAME (exit $EXIT_CODE)"
+  echo "cause: $cause"
+  [[ -n "$detail" ]] && echo "detail: $detail"
+} >> "$LOG"
+
+# Log rotation: keep last 200 lines if > 50KB
+if [[ -f "$LOG" ]] && [[ $(stat -f%z "$LOG" 2>/dev/null || echo 0) -gt 51200 ]]; then
+  tail -200 "$LOG" > "${LOG}.tmp" && mv "${LOG}.tmp" "$LOG"
+fi

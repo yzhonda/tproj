@@ -224,7 +224,7 @@ fi
 # ========== 4. バックアップ & コピー ==========
 
 # 4.1 tproj スクリプト
-CORE_BINS=(tproj tproj-drop-column tproj-toggle-yazi tproj-pane-focus-hook tproj-pane-clear-rank tproj-pane-watchdog agent-monitor team-watcher reflow-agent-pane rebalance-workspace-columns sign-codex wait-for-pane-text)
+CORE_BINS=(tproj tproj-drop-column tproj-kill-pane tproj-toggle-yazi tproj-pane-focus-hook tproj-pane-clear-rank tproj-pane-watchdog tproj-respawn-guard tproj-postmortem agent-monitor team-watcher reflow-agent-pane rebalance-workspace-columns sign-codex wait-for-pane-text)
 
 if $DRY_RUN; then
   for bin_name in "${CORE_BINS[@]}"; do
@@ -237,6 +237,14 @@ else
     cp "$SCRIPT_DIR/bin/$bin_name" ~/bin/"$bin_name"
     chmod +x ~/bin/"$bin_name"
   done
+
+  # Legacy cleanup: remove old launchd plist (renamed to com.tproj.memory-guard)
+  OLD_PLIST="$HOME/Library/LaunchAgents/com.memory-guard.plist"
+  if [[ -f "$OLD_PLIST" ]]; then
+    launchctl bootout "gui/$(id -u)" "$OLD_PLIST" 2>/dev/null || true
+    rm -f "$OLD_PLIST"
+    echo "  removed legacy $OLD_PLIST"
+  fi
 
   # Legacy cleanup: remove stale binaries from previous installs
   for legacy_bin in tproj-gui tproj-mcp-init; do

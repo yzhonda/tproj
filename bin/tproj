@@ -300,6 +300,9 @@ build_claude_launch_shell() {
     fi
   fi
 
+  # Append postmortem forensics on abnormal exit
+  command="$command; tproj-postmortem \$? claude"
+
   printf '%s' "$command"
 }
 
@@ -315,6 +318,9 @@ build_codex_launch_shell() {
   if [[ "$project_type" != "remote" && "$include_cd" == "true" ]]; then
     command="cd $(printf '%q' "$project_path") && $command"
   fi
+
+  # Append postmortem forensics on abnormal exit
+  command="$command; tproj-postmortem \$? codex"
 
   printf '%s' "$command"
 }
