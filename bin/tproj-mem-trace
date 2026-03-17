@@ -1,0 +1,163 @@
+#!/bin/bash
+# tproj-mem-trace - Memory growth tracker for tproj startup diagnostics
+# Usage: tproj-mem-trace [interval_sec] [duration_sec]
+#   Defaults: 5s interval, 300s (5min) duration
+#
+# Captures per-process RSS snapshots, tracks growth rates,
+# and identifies the fastest-growing memory consumers.
+# Output: /tmp/tproj-mem-trace.log (human-readable)
+#         /tmp/tproj-mem-trace.csv (machine-parseable)
+set -uo pipefail
+
+INTERVAL="${1:-5}"
+DURATION="${2:-300}"
+LOG="/tmp/tproj-mem-trace.log"
+CSV="/tmp/tproj-mem-trace.csv"
+SNAPSHOT_DIR="/tmp/tproj-mem-snapshots"
+
+mkdir -p "$SNAPSHOT_DIR"
+
+# Rotate old logs
+[[ -f "$LOG" ]] && mv "$LOG" "${LOG}.prev" 2>/dev/null || true
+[[ -f "$CSV" ]] && mv "$CSV" "${CSV}.prev" 2>/dev/null || true
+
+log() { echo "$(date '+%H:%M:%S') $1" | tee -a "$LOG"; }
+
+# CSV header
+echo "timestamp,elapsed_s,pid,rss_mb,comm,delta_mb" > "$CSV"
+
+log "=== tproj-mem-trace started ==="
+log "Interval: ${INTERVAL}s, Duration: ${DURATION}s"
+log "System RAM: $(sysctl -n hw.memsize | awk '{printf "%.0f GB", $1/1073741824}')"
+log ""
+
+declare -A prev_rss  # pid -> previous RSS in MB
+start_time=$(date +%s)
+tick=0
+
+take_snapshot() {
+  local ts elapsed snap_file
+  ts=$(date '+%H:%M:%S')
+  elapsed=$(( $(date +%s) - start_time ))
+  snap_file="$SNAPSHOT_DIR/snap_$(printf '%04d' $tick).txt"
+
+  # System-level memory
+  local vm_out page_size free_p inactive_p purgeable_p wired_p active_p avail_mb
+  vm_out=$(vm_stat 2>/dev/null)
+  page_size=$(sysctl -n vm.pagesize 2>/dev/null || echo 16384)
+  free_p=$(echo "$vm_out" | awk '/Pages free/ {gsub(/\./,"",$3); print $3}')
+  inactive_p=$(echo "$vm_out" | awk '/Pages inactive/ {gsub(/\./,"",$3); print $3}')
+  purgeable_p=$(echo "$vm_out" | awk '/Pages purgeable/ {gsub(/\./,"",$3); print $3}')
+  wired_p=$(echo "$vm_out" | awk '/Pages wired/ {gsub(/\./,"",$3); print $3}')
+  active_p=$(echo "$vm_out" | awk '/Pages active/ {gsub(/\./,"",$3); print $3}')
+  avail_mb=$(( (${free_p:-0} + ${inactive_p:-0} + ${purgeable_p:-0}) * page_size / 1048576 ))
+  local used_mb=$(( (${active_p:-0} + ${wired_p:-0}) * page_size / 1048576 ))
+  local swap_used
+  swap_used=$(sysctl vm.swapusage 2>/dev/null | grep -o 'used = [0-9.]*M' | grep -o '[0-9.]*' || echo "0")
+
+  # Per-process snapshot (top 30 by RSS, claude/codex/node highlighted)
+  local proc_data
+  proc_data=$(ps -eo pid,rss,comm 2>/dev/null | sort -k2 -rn | head -30)
+
+  # Track claude/codex/node specifically
+  local claude_total=0 codex_total=0 node_total=0 claude_count=0 codex_count=0 node_count=0
+  local biggest_grower="" biggest_delta=0
+
+  while read -r pid rss comm; do
+    [[ -z "$pid" || "$pid" == "PID" ]] && continue
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    local rss_mb=$(( rss / 1024 ))
+    local short_name="${comm##*/}"
+
+    # Track totals by type
+    case "$short_name" in
+      claude*) claude_total=$((claude_total + rss_mb)); claude_count=$((claude_count + 1)) ;;
+      codex*)  codex_total=$((codex_total + rss_mb)); codex_count=$((codex_count + 1)) ;;
+      node*)   node_total=$((node_total + rss_mb)); node_count=$((node_count + 1)) ;;
+    esac
+
+    # Delta tracking
+    local prev="${prev_rss[$pid]:-0}"
+    local delta=$((rss_mb - prev))
+    prev_rss[$pid]=$rss_mb
+
+    # Record to CSV (only claude/codex/node)
+    case "$short_name" in
+      claude*|codex*|node*|tproj*)
+        echo "$ts,$elapsed,$pid,$rss_mb,$short_name,$delta" >> "$CSV"
+        ;;
+    esac
+
+    # Track biggest grower
+    if [[ "$delta" -gt "$biggest_delta" ]]; then
+      biggest_delta=$delta
+      biggest_grower="PID $pid ($short_name) +${delta}MB -> ${rss_mb}MB"
+    fi
+  done <<< "$proc_data"
+
+  # Log summary
+  {
+    echo ""
+    echo "[$ts] +${elapsed}s | avail: ${avail_mb}MB | used: ${used_mb}MB | swap: ${swap_used}MB"
+    echo "  claude: ${claude_count} procs, ${claude_total}MB total"
+    echo "  codex:  ${codex_count} procs, ${codex_total}MB total"
+    echo "  node:   ${node_count} procs, ${node_total}MB total"
+    [[ "$biggest_delta" -gt 50 ]] && echo "  >> GROWTH: $biggest_grower"
+  } | tee -a "$LOG"
+
+  # Detailed snapshot for post-analysis
+  {
+    echo "--- Snapshot $tick ($ts, +${elapsed}s) ---"
+    echo "System: avail=${avail_mb}MB used=${used_mb}MB swap=${swap_used}MB"
+    echo "$proc_data" | head -15 | awk '{printf "  PID %6s  %6.0f MB  %s\n", $1, $2/1024, $3}'
+  } > "$snap_file"
+
+  tick=$((tick + 1))
+}
+
+# Alert thresholds
+WARN_AVAIL_MB=2048
+CRIT_AVAIL_MB=1024
+
+log "Monitoring... (Ctrl+C to stop)"
+log "Logs: $LOG"
+log "CSV:  $CSV"
+
+end_time=$((start_time + DURATION))
+
+while [[ $(date +%s) -lt $end_time ]]; do
+  take_snapshot
+
+  # Check for critical memory
+  local_avail=$(vm_stat 2>/dev/null | awk -v ps="$(sysctl -n vm.pagesize 2>/dev/null || echo 16384)" '
+    /Pages free/ {gsub(/\./,"",$3); f=$3}
+    /Pages inactive/ {gsub(/\./,"",$3); i=$3}
+    /Pages purgeable/ {gsub(/\./,"",$3); p=$3}
+    END {printf "%.0f", (f+i+p)*ps/1048576}
+  ')
+
+  if [[ "${local_avail:-9999}" -lt "$CRIT_AVAIL_MB" ]]; then
+    log "!! CRITICAL: Available memory ${local_avail}MB < ${CRIT_AVAIL_MB}MB !!"
+    log "!! System may start killing processes soon !!"
+    # Take rapid snapshots
+    INTERVAL=2
+  elif [[ "${local_avail:-9999}" -lt "$WARN_AVAIL_MB" ]]; then
+    log "! WARNING: Available memory ${local_avail}MB < ${WARN_AVAIL_MB}MB"
+  fi
+
+  sleep "$INTERVAL"
+done
+
+log ""
+log "=== Trace complete (${DURATION}s) ==="
+log "Review: $LOG"
+log "CSV:    $CSV"
+log "Snapshots: $SNAPSHOT_DIR/"
+
+# Summary: top growers
+log ""
+log "=== Top Memory Growers ==="
+if [[ -f "$CSV" ]]; then
+  # Sum deltas per PID
+  awk -F',' 'NR>1 && $6>0 {sum[$3]+=$6; name[$3]=$5} END {for(p in sum) if(sum[p]>50) printf "  PID %-6s  %s  grew +%dMB\n", p, name[p], sum[p]}' "$CSV" | sort -t+ -k2 -rn | head -10 | tee -a "$LOG"
+fi
