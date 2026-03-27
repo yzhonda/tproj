@@ -1,0 +1,107 @@
+#!/bin/bash
+# tproj-respawn-guard - Circuit-breaker wrapper for pane-died respawn
+# Called by tmux pane-died hook instead of direct respawn-pane.
+# 1. Kills orphaned child processes from the dead pane
+# 2. Checks circuit breaker (max 3 deaths in 120s)
+# 3. Respawns pane only if circuit breaker allows
+set -euo pipefail
+
+SESSION="${1:-}"
+PANE_ID="${2:-}"
+ROLE="${3:-}"
+
+[[ -z "$SESSION" || -z "$PANE_ID" ]] && exit 1
+
+LOG="/tmp/tproj-respawn-guard.log"
+DEATH_DIR="/tmp/tproj-respawn-deaths"
+CIRCUIT_WINDOW=120    # seconds
+CIRCUIT_MAX=3         # max deaths before circuit opens
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [$PANE_ID] $1" >> "$LOG"; }
+
+mkdir -p "$DEATH_DIR"
+
+# Log rotation: keep last 100 lines if > 100KB
+if [[ -f "$LOG" ]] && [[ $(stat -f%z "$LOG" 2>/dev/null || echo 0) -gt 102400 ]]; then
+  tail -100 "$LOG" > "${LOG}.tmp" && mv "${LOG}.tmp" "$LOG"
+fi
+# Clean death files older than 1 hour
+find "$DEATH_DIR" -type f -mmin +60 -delete 2>/dev/null || true
+
+# --- Step 1: Kill orphaned child processes from the dead pane ---
+pane_pid=$(tmux display-message -t "$PANE_ID" -p '#{pane_pid}' 2>/dev/null || true)
+if [[ -n "$pane_pid" ]]; then
+  # Kill all children of the pane shell (claude, node, mcp, etc.)
+  children=$(pgrep -P "$pane_pid" 2>/dev/null || true)
+  if [[ -n "$children" ]]; then
+    log "Killing children of pane_pid $pane_pid: $children"
+    for child in $children; do
+      # Kill grandchildren first (node/mcp spawned by claude)
+      grandchildren=$(pgrep -P "$child" 2>/dev/null || true)
+      for gc in $grandchildren; do
+        kill -TERM "$gc" 2>/dev/null || true
+      done
+      kill -TERM "$child" 2>/dev/null || true
+    done
+    sleep 1
+    # SIGKILL survivors
+    for child in $children; do
+      grandchildren=$(pgrep -P "$child" 2>/dev/null || true)
+      for gc in $grandchildren; do
+        kill -0 "$gc" 2>/dev/null && kill -9 "$gc" 2>/dev/null || true
+      done
+      kill -0 "$child" 2>/dev/null && kill -9 "$child" 2>/dev/null || true
+    done
+  fi
+fi
+
+# --- Step 2: Circuit breaker check ---
+death_file="$DEATH_DIR/${PANE_ID//\%/p}"
+now=$(date +%s)
+echo "$now" >> "$death_file"
+
+# Count deaths within window
+recent_deaths=0
+if [[ -f "$death_file" ]]; then
+  cutoff=$(( now - CIRCUIT_WINDOW ))
+  while read -r ts; do
+    [[ -z "$ts" ]] && continue
+    if [[ "$ts" -ge "$cutoff" ]]; then
+      recent_deaths=$(( recent_deaths + 1 ))
+    fi
+  done < "$death_file"
+
+  # Trim old entries
+  awk -v cutoff="$cutoff" '$1 >= cutoff' "$death_file" > "${death_file}.tmp" 2>/dev/null
+  mv "${death_file}.tmp" "$death_file" 2>/dev/null || true
+fi
+
+if [[ "$recent_deaths" -gt "$CIRCUIT_MAX" ]]; then
+  log "CIRCUIT OPEN: $PANE_ID ($ROLE) died $recent_deaths times in ${CIRCUIT_WINDOW}s - NOT respawning"
+  osascript -e "display notification \"Pane $PANE_ID ($ROLE) crashed $recent_deaths times - respawn stopped\" with title \"tproj\" subtitle \"Circuit Breaker Open\"" 2>/dev/null || true
+  logger "tproj-respawn-guard: circuit breaker open for $PANE_ID ($ROLE), $recent_deaths deaths in ${CIRCUIT_WINDOW}s"
+  exit 0
+fi
+
+# --- Step 2.5: Memory check before respawn ---
+# Use free + inactive + purgeable (macOS keeps "free" artificially low due to caching)
+vm_out=$(vm_stat 2>/dev/null)
+page_size=$(sysctl -n vm.pagesize 2>/dev/null || echo 16384)
+free_p=$(echo "$vm_out" | awk '/Pages free/ {gsub(/\./,"",$3); print $3}')
+inactive_p=$(echo "$vm_out" | awk '/Pages inactive/ {gsub(/\./,"",$3); print $3}')
+purgeable_p=$(echo "$vm_out" | awk '/Pages purgeable/ {gsub(/\./,"",$3); print $3}')
+avail_mb=$(( (${free_p:-0} + ${inactive_p:-0} + ${purgeable_p:-0}) * page_size / 1048576 ))
+
+# Dynamic threshold: 2% of physical RAM (48GB -> ~983MB)
+total_phys_mb=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 25769803776) / 1024 / 1024 ))
+respawn_block_mb=$(( total_phys_mb * 2 / 100 ))
+
+if [[ "$avail_mb" -lt "$respawn_block_mb" ]]; then
+  log "MEMORY LOW: ${avail_mb}MB available (threshold: ${respawn_block_mb}MB) - NOT respawning $PANE_ID ($ROLE)"
+  osascript -e "display notification \"Memory low (${avail_mb}MB available) - respawn blocked for $ROLE\" with title \"tproj\" subtitle \"Memory Guard\"" 2>/dev/null || true
+  exit 0
+fi
+
+# --- Step 3: Respawn ---
+log "Respawning $PANE_ID ($ROLE) (death $recent_deaths/${CIRCUIT_MAX} in window)"
+tmux respawn-pane -t "$PANE_ID" 2>/dev/null || true

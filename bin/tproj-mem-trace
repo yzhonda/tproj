@@ -115,9 +115,10 @@ take_snapshot() {
   tick=$((tick + 1))
 }
 
-# Alert thresholds
-WARN_AVAIL_MB=2048
-CRIT_AVAIL_MB=1024
+# Alert thresholds (dynamic: scale with physical RAM)
+TOTAL_PHYS_MB=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 25769803776) / 1024 / 1024 ))
+WARN_AVAIL_MB=$(( TOTAL_PHYS_MB * 5 / 100 ))   # 5% of RAM (48GB -> ~2457MB)
+CRIT_AVAIL_MB=$(( TOTAL_PHYS_MB * 2 / 100 ))   # 2% of RAM (48GB -> ~983MB)
 
 log "Monitoring... (Ctrl+C to stop)"
 log "Logs: $LOG"

@@ -240,8 +240,9 @@ else
 
   # Legacy cleanup: remove old launchd plist (renamed to com.tproj.memory-guard)
   OLD_PLIST="$HOME/Library/LaunchAgents/com.memory-guard.plist"
+  # Always try bootout (plist may be loaded even if file was already deleted)
+  launchctl bootout "gui/$(id -u)/com.memory-guard" 2>/dev/null || true
   if [[ -f "$OLD_PLIST" ]]; then
-    launchctl bootout "gui/$(id -u)" "$OLD_PLIST" 2>/dev/null || true
     rm -f "$OLD_PLIST"
     echo "  removed legacy $OLD_PLIST"
   fi
