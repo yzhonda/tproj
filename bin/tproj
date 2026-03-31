@@ -866,6 +866,7 @@ add_workspace_column() {
   claude_title="$(build_pane_label "$src_type" "$src_host" "$src_path" "CC" "$src_alias")"
   codex_title="$(build_pane_label "$src_type" "$src_host" "$src_path" "Codex" "$src_alias")"
   tmux set-option -pt "$new_claude" allow-set-title off 2>/dev/null || true
+  tmux set-option -pt "$new_codex" allow-set-title off 2>/dev/null || true
   tmux select-pane -t "$new_claude" -T "$claude_title" 2>/dev/null || true
   tmux select-pane -t "$new_codex" -T "$codex_title" 2>/dev/null || true
 
@@ -1609,7 +1610,7 @@ create_workspace_layout() {
 
   # 追加の Codex ペインを横に作成
   local prev_codex="$first_codex"
-  for i in $(seq 2 $num_projects); do
+  for ((i=2; i<=num_projects; i++)); do
     local proj_path="${paths[$((i-1))]}"
     local proj_type="${types[$((i-1))]}"
     local dir="$proj_path"
@@ -1631,7 +1632,7 @@ create_workspace_layout() {
   sleep 0.3
 
   # 各 Codex の下に Claude を作成
-  for i in $(seq 1 $num_projects); do
+  for ((i=1; i<=num_projects; i++)); do
     local proj_path="${paths[$((i-1))]}"
     local proj_type="${types[$((i-1))]}"
     local proj_host="${hosts[$((i-1))]}"
@@ -1657,8 +1658,9 @@ create_workspace_layout() {
     # ペインタイトル設定
     codex_title="$(build_pane_label "$proj_type" "$proj_host" "$proj_path" "Codex" "${aliases[$((i-1))]}")"
     claude_title="$(build_pane_label "$proj_type" "$proj_host" "$proj_path" "CC" "${aliases[$((i-1))]}")"
-    # Claude が OSC タイトルで pane_title を上書きするため固定化
+    # CC/Codex が OSC タイトルで pane_title を上書きするため固定化
     tmux set-option -pt "$claude_pane" allow-set-title off 2>/dev/null || true
+    tmux set-option -pt "$codex_pane" allow-set-title off 2>/dev/null || true
     tmux select-pane -t "$codex_pane" -T "$codex_title" 2>/dev/null || true
     tmux select-pane -t "$claude_pane" -T "$claude_title" 2>/dev/null || true
 
@@ -1682,7 +1684,7 @@ create_workspace_layout() {
   local window_width=$(tmux display-message -t "$session:dev" -p '#{window_width}')
   local column_width=$((window_width / num_projects))
 
-  for i in $(seq 0 $((num_projects - 1))); do
+  for ((i=0; i<num_projects; i++)); do
     local codex_pane="${codex_panes[$i]}"
     [[ -z "$codex_pane" ]] && continue
     tmux resize-pane -t "$codex_pane" -x "$column_width" 2>/dev/null || true
@@ -1692,7 +1694,7 @@ create_workspace_layout() {
 
   # git window（最初のローカルプロジェクトのディレクトリ、なければ /tmp）
   local git_dir="/tmp"
-  for i in $(seq 0 $((num_projects - 1))); do
+  for ((i=0; i<num_projects; i++)); do
     if [[ "${types[$i]}" == "local" ]]; then
       git_dir="${paths[$i]}"
       break
@@ -1836,7 +1838,7 @@ start_workspace_tools() {
   fi
 
   # Start panes per column (staggered to avoid memory spike from concurrent npm updates)
-  for i in $(seq 1 $num_projects); do
+  for ((i=1; i<=num_projects; i++)); do
     start_codex_for_column "$session" "$no_update" "$i" \
       "${paths[$((i-1))]}" "${types[$((i-1))]}" "${hosts[$((i-1))]}" "${cdx_launches[$((i-1))]:-true}"
     sleep 0.5
@@ -1931,8 +1933,9 @@ if [[ "$WORKSPACE_MODE" == "true" ]]; then
     codex_title=""
     claude_title="$(build_pane_label "${REMOTE_HOST:+remote}" "$title_host" "$root" "CC" "$name")"
     codex_title="$(build_pane_label "${REMOTE_HOST:+remote}" "$title_host" "$root" "Codex" "$name")"
-    # 単一モードの Claude でもタイトル上書きを抑止
+    # CC/Codex の OSC タイトル上書きを抑止
     tmux set-option -pt "$session:dev.1" allow-set-title off 2>/dev/null || true
+    tmux set-option -pt "$session:dev.2" allow-set-title off 2>/dev/null || true
     tmux select-pane -t "$session:dev.1" -T "$claude_title" 2>/dev/null || true
     tmux select-pane -t "$session:dev.2" -T "$codex_title" 2>/dev/null || true
 

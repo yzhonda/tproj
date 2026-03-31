@@ -28,7 +28,7 @@ if [[ -f "$TPROJ_GUI_PIDFILE" ]]; then
   kill "$(<"$TPROJ_GUI_PIDFILE")" 2>/dev/null || true
   rm -f "$TPROJ_GUI_PIDFILE"
 fi
-pkill -f 'apps/tproj/dist/tproj.app/Contents/MacOS/tproj|\.build/.*/tproj$|tproj-gui' 2>/dev/null || true
+pkill -f 'apps/tproj/dist/tproj.app/Contents/MacOS/tproj|\.build/.*/debug/tproj|tproj-gui' 2>/dev/null || true
 sleep 0.3
 
 # --- Launch ---
