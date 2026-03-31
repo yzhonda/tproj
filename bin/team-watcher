@@ -52,12 +52,22 @@ tmux set-hook -t "$SESSION" after-split-window \
 
 # === Phase 2: Background polling loop ===
 # Fork into background and return control to Claude Code immediately
+# Singleton guard: only one polling daemon per session
+PIDFILE="/tmp/tproj-team-watcher-${SESSION}.pid"
+if [[ -f "$PIDFILE" ]]; then
+  existing_pid=$(cat "$PIDFILE" 2>/dev/null || true)
+  if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
+    exit 0  # Phase 2 already running for this session
+  fi
+  rm -f "$PIDFILE"
+fi
 
 (
+  echo $$ > "$PIDFILE"
   cleanup() {
     tmux set-hook -u -t "$SESSION" after-split-window 2>/dev/null || true
     tmux set-environment -u -t "$SESSION" TPROJ_AGENTS_ACTIVE 2>/dev/null || true
-    rm -f "/tmp/tproj-dead-agents"
+    rm -f "/tmp/tproj-dead-agents" "$PIDFILE"
 
     # Read and unset saved claude width(s)
     if [[ "$WORKSPACE_MODE" == "true" ]]; then
@@ -78,7 +88,7 @@ tmux set-hook -t "$SESSION" after-split-window \
         pane_id="${pane_info%%:*}"
         [[ -z "$role" ]] && continue
         if [[ "$role" == agent-p*-* ]]; then
-          tmux kill-pane -t "$pane_id" 2>/dev/null || true
+          "$HOME/bin/tproj-kill-pane" "$pane_id" "$role" 2>/dev/null || true
         fi
       done
     else
@@ -105,7 +115,7 @@ tmux set-hook -t "$SESSION" after-split-window \
         [[ " $protected " == *" $role "* ]] && continue
         [[ -z "$role" ]] && continue
         if [[ "$role" == agent-* ]]; then
-          tmux kill-pane -t "$pane_id" 2>/dev/null || true
+          "$HOME/bin/tproj-kill-pane" "$pane_id" "$role" 2>/dev/null || true
         fi
       done
 

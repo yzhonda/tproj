@@ -1,0 +1,63 @@
+#!/bin/bash
+set -euo pipefail
+# tproj-kill-pane - Graceful pane shutdown with descendant cleanup
+# Usage: tproj-kill-pane <pane_id> [<role>]
+#
+# 1. Sends C-c + exit command (role-aware)
+# 2. Waits for graceful exit
+# 3. If pane still alive: collects descendant tree, SIGTERM, SIGKILL survivors
+# 4. Kills the pane
+#
+# Exit command rules (matches tproj-drop-column:send_exit_signal / bin/tproj:704):
+#   claude* / terminal-* / unknown -> "exit"
+#   codex* / agent-*              -> "/exit"
+
+PANE_ID="${1:-}"
+ROLE="${2:-}"
+[[ -z "$PANE_ID" ]] && { echo "Usage: tproj-kill-pane <pane_id> [<role>]" >&2; exit 1; }
+
+# Resolve role from @role tag if not provided
+if [[ -z "$ROLE" ]]; then
+  ROLE=$(tmux display-message -t "$PANE_ID" -p '#{@role}' 2>/dev/null || true)
+fi
+
+# Check pane exists
+tmux display-message -t "$PANE_ID" -p '#{pane_id}' >/dev/null 2>&1 || exit 0
+
+# Determine exit command by role
+case "$ROLE" in
+  codex-p*|codex|agent-p*|agent-*) EXIT_CMD="/exit" ;;
+  *) EXIT_CMD="exit" ;;
+esac
+
+# Phase 1: Graceful exit
+tmux send-keys -t "$PANE_ID" C-c 2>/dev/null || exit 0
+sleep 0.3
+tmux send-keys -t "$PANE_ID" "$EXIT_CMD" Enter 2>/dev/null || true
+sleep 1.5
+
+# Phase 2: Check if pane exited gracefully
+pane_pid=$(tmux display-message -t "$PANE_ID" -p '#{pane_pid}' 2>/dev/null) || exit 0
+[[ -z "$pane_pid" ]] && exit 0
+
+# Collect descendants recursively (always returns 0)
+collect() {
+  local p=$1 kids
+  kids=$(pgrep -P "$p" 2>/dev/null || true)
+  [[ -z "$kids" ]] && return 0
+  local k
+  for k in $kids; do collect "$k"; echo "$k"; done
+  return 0
+}
+descs=$(collect "$pane_pid")
+
+if [[ -n "$descs" ]]; then
+  # SIGTERM all descendants
+  for d in $descs; do kill -TERM "$d" 2>/dev/null || true; done
+  sleep 0.5
+  # SIGKILL survivors
+  for d in $descs; do kill -0 "$d" 2>/dev/null && kill -9 "$d" 2>/dev/null || true; done
+fi
+
+# Phase 3: Kill pane
+tmux kill-pane -t "$PANE_ID" 2>/dev/null || true
