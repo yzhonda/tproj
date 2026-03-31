@@ -524,6 +524,44 @@ private enum SnapEdge {
     case left    // tproj is to the left of Ghostty
 }
 
+// Proxy that intercepts windowWillResize to lock width while snapped to Ghostty.
+// All other delegate calls are forwarded to the original SwiftUI-owned delegate.
+@MainActor
+final class SnapResizeProxy: NSObject, NSWindowDelegate {
+    weak var original: (any NSWindowDelegate)?
+    weak var tracker: GhosttyWindowTracker?
+
+    func windowWillResize(_ sender: NSWindow, to frameSize: NSSize) -> NSSize {
+        let proposed = original?.windowWillResize?(sender, to: frameSize) ?? frameSize
+        guard let tracker = tracker, tracker.isSnapped else { return proposed }
+
+        // Detect corner drag via mouse position
+        let mouse = sender.mouseLocationOutsideOfEventStream
+        let frame = sender.frame
+        let cornerSize: CGFloat = 20
+        let isCorner = (mouse.x < cornerSize || mouse.x > frame.width - cornerSize)
+                    && (mouse.y < cornerSize || mouse.y > frame.height - cornerSize)
+
+        if isCorner {
+            // Corner drag while snapped: lock width, allow height only
+            return NSSize(width: frame.width, height: proposed.height)
+        }
+        return proposed
+    }
+
+    override func responds(to aSelector: Selector!) -> Bool {
+        if super.responds(to: aSelector) { return true }
+        return original?.responds(to: aSelector) ?? false
+    }
+
+    override func forwardingTarget(for aSelector: Selector!) -> Any? {
+        if let orig = original, (orig as AnyObject).responds(to: aSelector) {
+            return orig
+        }
+        return super.forwardingTarget(for: aSelector)
+    }
+}
+
 @MainActor
 final class GhosttyWindowTracker: ObservableObject {
     @Published var isSnapped = false
@@ -532,6 +570,7 @@ final class GhosttyWindowTracker: ObservableObject {
 
     private var pollTimer: DispatchSourceTimer?
     private weak var appWindow: NSWindow?
+    private var resizeProxy: SnapResizeProxy?
 
     private let snapThreshold: CGFloat = 12
     private let snapYAlignThreshold: CGFloat = 100
@@ -545,11 +584,22 @@ final class GhosttyWindowTracker: ObservableObject {
         guard appWindow !== window else { return }
         detach()
         appWindow = window
+        // Install delegate proxy to intercept resize while snapped
+        let proxy = SnapResizeProxy()
+        proxy.original = window.delegate
+        proxy.tracker = self
+        resizeProxy = proxy
+        window.delegate = proxy
         startPolling()
     }
 
     func detach() {
         stopPolling()
+        // Restore original delegate before releasing the proxy
+        if let proxy = resizeProxy, let window = appWindow {
+            window.delegate = proxy.original
+        }
+        resizeProxy = nil
         appWindow = nil
         isSnapped = false
         lastGhosttyFrame = nil
@@ -1399,18 +1449,20 @@ private final class MIDIPaneActivator {
 
     private func handlePacketList(_ packetList: UnsafePointer<MIDIPacketList>) {
         let numPackets = Int(packetList.pointee.numPackets)
-        guard numPackets > 0 else { return }
+        guard numPackets > 0, numPackets < 256 else { return }
 
-        var packet = packetList.pointee.packet
-        for i in 0..<numPackets {
-            // Direct tuple access (same as dj_presenter)
-            let statusByte = packet.data.0
-            let data1 = packet.data.1
-            let data2 = packet.data.2
+        // Get a stable pointer to the first packet inside the packet list
+        let firstPktPtr = UnsafeRawPointer(packetList).advanced(
+            by: MemoryLayout<UInt32>.size  // skip numPackets field
+        ).assumingMemoryBound(to: MIDIPacket.self)
+
+        var pktPtr = firstPktPtr
+        for _ in 0..<numPackets {
+            let statusByte = pktPtr.pointee.data.0
+            let data1 = pktPtr.pointee.data.1
+            let data2 = pktPtr.pointee.data.2
             handleMessage(status: statusByte, data1: data1, data2: data2)
-            if i < numPackets - 1 {
-                packet = MIDIPacketNext(&packet).pointee
-            }
+            pktPtr = UnsafePointer(MIDIPacketNext(pktPtr))
         }
     }
 
@@ -3719,17 +3771,35 @@ struct Card<Content: View>: View {
 
 struct SectionHeader: View {
     let title: String
+    var isCollapsed: Binding<Bool>? = nil
 
     var body: some View {
-        HStack(spacing: 4) {
-            Rectangle()
-                .fill(GhosttyTheme.current.foreground.opacity(0.15))
-                .frame(width: 12, height: 1)
-            Text(title)
-                .font(GhosttyTheme.current.font(size: 16, weight: .semibold))
-                .foregroundStyle(GhosttyTheme.current.textPrimary)
+        if let binding = isCollapsed {
+            Button(action: { withAnimation(.easeInOut(duration: 0.2)) { binding.wrappedValue.toggle() } }) {
+                HStack(spacing: 4) {
+                    Image(systemName: binding.wrappedValue ? "chevron.right" : "chevron.down")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(GhosttyTheme.current.foreground.opacity(0.4))
+                        .frame(width: 12)
+                    Text(title)
+                        .font(GhosttyTheme.current.font(size: 16, weight: .semibold))
+                        .foregroundStyle(GhosttyTheme.current.textPrimary)
+                }
+                .padding(.leading, 1)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+        } else {
+            HStack(spacing: 4) {
+                Rectangle()
+                    .fill(GhosttyTheme.current.foreground.opacity(0.15))
+                    .frame(width: 12, height: 1)
+                Text(title)
+                    .font(GhosttyTheme.current.font(size: 16, weight: .semibold))
+                    .foregroundStyle(GhosttyTheme.current.textPrimary)
+            }
+            .padding(.leading, 1)
         }
-        .padding(.leading, 1)
     }
 }
 
@@ -3847,6 +3917,13 @@ struct ActionButton: View {
     }
 }
 
+private struct ContentHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 private struct WorkspaceResizeDivider: View {
     @Binding var height: Double
     let maxHeight: Double
@@ -3903,6 +3980,30 @@ private struct WorkspaceResizeDivider: View {
     }
 }
 
+// Visual hint at the window bottom edge indicating resize is available
+private struct WindowResizeGrip: View {
+    @State private var isHovered = false
+
+    var body: some View {
+        HStack(spacing: 3) {
+            ForEach(0..<3, id: \.self) { _ in
+                Circle()
+                    .fill(GhosttyTheme.current.foreground.opacity(isHovered ? 0.4 : 0.15))
+                    .frame(width: 4, height: 4)
+            }
+        }
+        .frame(height: 12)
+        .frame(maxWidth: .infinity)
+        .contentShape(Rectangle())
+        .onHover { hovering in
+            isHovered = hovering
+            if hovering { NSCursor.resizeUpDown.push() }
+            else { NSCursor.pop() }
+        }
+        .animation(.easeOut(duration: 0.14), value: isHovered)
+    }
+}
+
 struct ContentView: View {
     @StateObject private var vm = AppViewModel()
     @StateObject private var ghosttyTracker = GhosttyWindowTracker()
@@ -3910,6 +4011,9 @@ struct ContentView: View {
     @StateObject private var collapseController = WindowCollapseController()
     @StateObject private var underlayController = PaneBackgroundUnderlayController()
     @AppStorage("workspaceSectionHeight") private var workspaceHeight: Double = 480
+    @AppStorage("monitorSectionHeight") private var monitorHeight: Double = -1
+    @AppStorage("workspaceSectionCollapsed") private var workspaceCollapsed = false
+    @AppStorage("monitorSectionCollapsed") private var monitorCollapsed = false
     @State private var draggingColumnID: Int?
     @State private var dropInsertionIndex: Int?
     @State private var isDragActive = false
@@ -4037,7 +4141,7 @@ struct ContentView: View {
     }
 
     @ViewBuilder
-    private var remainingSections: some View {
+    private var upperRemainingSections: some View {
         SectionHeader(title: "Memory")
         Card(compact: true, chrome: false) {
             memorySection()
@@ -4047,16 +4151,25 @@ struct ContentView: View {
         Card(compact: true, chrome: false) {
             monitorSection()
         }
+    }
 
-        SectionHeader(title: "Workspace YAML")
-        Card {
-            HStack(spacing: 0) {
-                ActionButton("Open workspace.yaml", tone: .neutral, isEnabled: !vm.isBusy, dense: true) {
-                    vm.openWorkspaceYAML()
+    @ViewBuilder
+    private var yamlFooter: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            SectionHeader(title: "Workspace YAML")
+            Card {
+                HStack(spacing: 0) {
+                    ActionButton("Open workspace.yaml", tone: .neutral, isEnabled: !vm.isBusy, dense: true) {
+                        vm.openWorkspaceYAML()
+                    }
+                    Spacer(minLength: 0)
                 }
-                Spacer(minLength: 0)
             }
+            // Bottom resize grip indicator
+            WindowResizeGrip()
         }
+        .padding(.horizontal, 4)
+        .padding(.bottom, 2)
     }
 
     @ViewBuilder
@@ -4069,48 +4182,66 @@ struct ContentView: View {
             if workspaceRowCount < 10 {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 4) {
-                        SectionHeader(title: "Current Workspace")
-                        Card(compact: true, chrome: false) {
-                            workspaceControlHeader
-                            workspaceListContent
+                        SectionHeader(title: "Current Workspace", isCollapsed: $workspaceCollapsed)
+                        if !workspaceCollapsed {
+                            Card(compact: true, chrome: false) {
+                                workspaceControlHeader
+                                workspaceListContent
+                            }
                         }
-                        remainingSections
+                        SectionHeader(title: "Memory / CC & Codex", isCollapsed: $monitorCollapsed)
+                        if !monitorCollapsed {
+                            upperRemainingSections
+                        }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 4)
                     .padding(.top, 4)
                 }
                 .frame(maxWidth: .infinity)
+                .safeAreaInset(edge: .bottom, spacing: 0) { yamlFooter }
             } else {
                 GeometryReader { geo in
                     let maxH = geo.size.height * 0.8
                     VStack(spacing: 0) {
-                        VStack(alignment: .leading, spacing: 4) {
-                            SectionHeader(title: "Current Workspace")
-                            Card(compact: true, chrome: false) {
-                                workspaceControlHeader
-                                ScrollView {
-                                    workspaceListContent
+                        // -- Top: Current Workspace --
+                        SectionHeader(title: "Current Workspace", isCollapsed: $workspaceCollapsed)
+                            .padding(.horizontal, 4)
+                            .padding(.top, 4)
+
+                        if !workspaceCollapsed {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Card(compact: true, chrome: false) {
+                                    workspaceControlHeader
+                                    ScrollView {
+                                        workspaceListContent
+                                    }
                                 }
                             }
-                        }
-                        .frame(height: workspaceHeight)
-                        .padding(.horizontal, 4)
-                        .padding(.top, 4)
-                        .clipped()
-
-                        WorkspaceResizeDivider(height: $workspaceHeight, maxHeight: maxH)
-
-                        ScrollView {
-                            VStack(alignment: .leading, spacing: 4) {
-                                remainingSections
-                            }
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .frame(height: workspaceHeight)
                             .padding(.horizontal, 4)
+                            .clipped()
+
+                            WorkspaceResizeDivider(height: $workspaceHeight, maxHeight: maxH)
                         }
-                        .frame(maxWidth: .infinity)
+
+                        // -- Middle: Memory / CC & Codex (fills remaining space) --
+                        SectionHeader(title: "Memory / CC & Codex", isCollapsed: $monitorCollapsed)
+                            .padding(.horizontal, 4)
+
+                        if !monitorCollapsed {
+                            ScrollView {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    upperRemainingSections
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 4)
+                            }
+                            .frame(maxWidth: .infinity)
+                        }
                     }
                 }
+                .safeAreaInset(edge: .bottom, spacing: 0) { yamlFooter }
             }
         }
         .overlay(alignment: .topTrailing) {
@@ -5024,7 +5155,7 @@ struct TprojApp: App {
     var body: some Scene {
         Window("tproj", id: "main") {
             ContentView()
-                .frame(minWidth: 14, minHeight: 520, idealHeight: 980, maxHeight: 2200)
+                .frame(minWidth: 14, maxWidth: 550, minHeight: 520, idealHeight: 980, maxHeight: 2200)
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 275, height: 980)
