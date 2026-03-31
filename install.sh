@@ -366,13 +366,13 @@ if ! $CORE_ONLY; then
     if ! $DRY_RUN; then
       cp "$SCRIPT_DIR/extensions/messaging/tproj-msg" ~/bin/
       chmod +x ~/bin/tproj-msg
-      # Install msg skill if Claude Code skills dir exists
-      if [[ -d "$HOME/.claude/skills" ]]; then
-        mkdir -p "$HOME/.claude/skills/msg"
-        cp "$SCRIPT_DIR/extensions/messaging/skill-msg/SKILL.md" "$HOME/.claude/skills/msg/"
-      fi
+      # Install msg skill for Claude Code and Codex
+      mkdir -p "$HOME/.claude/skills/msg" "$HOME/.codex/skills/msg"
+      cp "$SCRIPT_DIR/extensions/messaging/skill-msg/SKILL.md" "$HOME/.claude/skills/msg/"
+      cp "$SCRIPT_DIR/extensions/messaging/skill-msg/SKILL.md" "$HOME/.codex/skills/msg/"
     else
       echo "    [DRY-RUN] tproj-msg -> ~/bin/"
+      echo "    [DRY-RUN] msg skill -> ~/.claude/skills/ + ~/.codex/skills/"
     fi
   fi
 
@@ -422,7 +422,7 @@ if ! $CORE_ONLY; then
         PLIST_DIR="$HOME/Library/LaunchAgents"
         PLIST_FILE="$PLIST_DIR/com.tproj.memory-guard.plist"
         mkdir -p "$PLIST_DIR"
-        sed "s|\${HOME}|$HOME|g" "$SCRIPT_DIR/extensions/memory/launchd/com.tproj.memory-guard.plist.template" > "$PLIST_FILE"
+        sed "s|__HOME__|$HOME|g" "$SCRIPT_DIR/extensions/memory/launchd/com.tproj.memory-guard.plist.template" > "$PLIST_FILE"
         launchctl bootout "gui/$(id -u)/com.tproj.memory-guard" 2>/dev/null || true
         launchctl bootstrap "gui/$(id -u)" "$PLIST_FILE" 2>/dev/null || true
         echo "    ✅ memory-guard launchd daemon installed"
@@ -461,3 +461,9 @@ echo "Usage:"
 echo "   Single project: cd <project> && tproj"
 echo "   Multi-project:  cp config/workspace.yaml.example ~/.config/tproj/workspace.yaml"
 echo "                   # edit workspace.yaml, then run tproj"
+if ! $CORE_ONLY; then
+  echo ""
+  echo "Optional environment variables (add to your shell profile):"
+  echo '   export TPROJ_LABEL_HOOK=cc-persona          # persona labels on pane titles'
+  echo '   export TPROJ_AFTER_LAYOUT_HOOK=tproj-pane-bg # AI-generated pane backgrounds'
+fi
