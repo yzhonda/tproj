@@ -113,25 +113,46 @@ tproj supports hooks for customization:
 
 When set, tproj calls `$TPROJ_LABEL_HOOK --label <project_path> <cc|cdx>` to generate a suffix for pane titles. This lets you add persona labels, status indicators, or any custom text to your pane titles.
 
+## Extensions
+
+tproj ships with optional extensions installed by default (except memory).
+
+| Extension | What it does | Install |
+|-----------|-------------|---------|
+| **messaging** | Inter-pane AI messaging (tproj-msg) | default |
+| **persona** | Deterministic AI persona generation + pane backgrounds | default |
+| **agent-teams** | Claude Code Agent Teams pane management | default |
+| **memory** | Memory monitoring + watchdog daemon | `--with-memory` |
+
+```bash
+./install.sh              # core + messaging + persona + agent-teams
+./install.sh --all        # everything including memory
+./install.sh --core-only  # minimal (no extensions)
+```
+
+See each extension's README under `extensions/` for details.
+
 ## Repository layout
 
 ```
-bin/
-  tproj                        # main launcher
-  tproj-drop-column             # batch column removal
-  tproj-toggle-yazi             # yazi pane toggle
-  rebalance-workspace-columns   # column width equalizer
-  reflow-agent-pane             # Agent Teams pane repositioner
-  team-watcher                  # Agent Teams hook daemon
-  agent-monitor                 # per-agent status display
-  sign-codex                    # macOS code signing for Codex
-  wait-for-pane-text            # wait for text in a tmux pane
-config/
-  tmux/tmux.conf                # tmux configuration
-  terminfo/                     # terminal capability files
-  yazi/                         # yazi file manager config
-  workspace.yaml.example        # workspace template
+bin/                            # core scripts
+  tproj                         #   main launcher
+  tproj-drop-column             #   batch column removal
+  tproj-toggle-yazi             #   yazi pane toggle
+  rebalance-workspace-columns   #   column width equalizer
+  sign-codex                    #   macOS code signing for Codex
+  wait-for-pane-text            #   wait for text in a tmux pane
+config/                         # core configuration
+  tmux/tmux.conf                #   tmux settings
+  terminfo/                     #   terminal capability files
+  yazi/                         #   yazi file manager config
+  workspace.yaml.example        #   workspace template
 apps/tproj/                     # SwiftUI GUI app source
+extensions/                     # optional extensions
+  messaging/                    #   tproj-msg + msg skill
+  persona/                      #   cc-persona + tproj-pane-bg
+  agent-teams/                  #   team-watcher, reflow-agent-pane, agent-monitor
+  memory/                       #   cc-mem, memory-guard, tproj-mem-json
 ```
 
 ## Notes

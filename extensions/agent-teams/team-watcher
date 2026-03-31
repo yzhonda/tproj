@@ -1,0 +1,260 @@
+#!/bin/bash
+# team-watcher - Agent Teams hook-based pane management daemon
+# Phase 1: Synchronous setup (hook + env var) - completes before Claude Code proceeds
+# Phase 2: Background polling loop (name resolution + cleanup) - forked & disowned
+set -eo pipefail
+
+SESSION=$(tmux display-message -p '#S' 2>/dev/null) || exit 0
+TEAM_DIR="$HOME/.claude/teams"
+
+# ワークスペースモード判定
+if [[ "$SESSION" == "tproj-workspace" ]]; then
+  WORKSPACE_MODE=true
+else
+  WORKSPACE_MODE=false
+fi
+
+# Guard: only act in tproj sessions (requires :dev window with @role=claude or claude-p*)
+if [[ "$WORKSPACE_MODE" == "true" ]]; then
+  tmux list-panes -t "$SESSION:dev" -F '#{@role}' 2>/dev/null \
+    | grep -q '^claude-p[0-9]\+$' || exit 0
+else
+  tmux list-panes -t "$SESSION:dev" -F '#{@role}' 2>/dev/null \
+    | grep -q '^claude$' || exit 0
+fi
+
+# === Phase 1: Synchronous setup ===
+# These MUST complete before Claude Code spawns agents
+
+# Signal reflow-agent-pane to act on new splits
+tmux set-environment -t "$SESSION" TPROJ_AGENTS_ACTIVE 1
+
+# Save original pane dimensions BEFORE any agent splits happen
+if [[ "$WORKSPACE_MODE" == "true" ]]; then
+  # マルチプロジェクトモード: 各列の Claude 幅を個別に保存
+  while IFS=: read -r role width column; do
+    [[ "$role" =~ ^claude-p[0-9]+$ ]] || continue
+    [[ -n "$column" && -n "$width" ]] && \
+      tmux set-environment -t "$SESSION" "TPROJ_CLAUDE_WIDTH_P${column}" "$width"
+  done < <(tmux list-panes -t "$SESSION:dev" -F '#{@role}:#{pane_width}:#{@column}' 2>/dev/null)
+else
+  # 単一プロジェクトモード
+  CLAUDE_W=$(tmux list-panes -t "$SESSION:dev" -F '#{@role}:#{pane_width}' 2>/dev/null \
+    | grep '^claude:' | cut -d: -f2)
+  [[ -n "$CLAUDE_W" ]] && tmux set-environment -t "$SESSION" TPROJ_CLAUDE_WIDTH "$CLAUDE_W"
+fi
+
+# Install after-split-window hook: runs reflow-agent-pane on every new split
+# - run-shell -d 0.3: coalesces burst spawns (multiple panes created rapidly)
+# - wait-for -L/U: tmux-native lock for serialization
+tmux set-hook -t "$SESSION" after-split-window \
+  "run-shell -b -d 0.3 'tmux wait-for -L tproj-reflow; $HOME/bin/reflow-agent-pane \"$SESSION\"; tmux wait-for -U tproj-reflow'"
+
+# === Phase 2: Background polling loop ===
+# Fork into background and return control to Claude Code immediately
+# Singleton guard: only one polling daemon per session
+PIDFILE="/tmp/tproj-team-watcher-${SESSION}.pid"
+if [[ -f "$PIDFILE" ]]; then
+  existing_pid=$(cat "$PIDFILE" 2>/dev/null || true)
+  if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
+    exit 0  # Phase 2 already running for this session
+  fi
+  rm -f "$PIDFILE"
+fi
+
+(
+  echo $$ > "$PIDFILE"
+  cleanup() {
+    tmux set-hook -u -t "$SESSION" after-split-window 2>/dev/null || true
+    tmux set-environment -u -t "$SESSION" TPROJ_AGENTS_ACTIVE 2>/dev/null || true
+    rm -f "/tmp/tproj-dead-agents" "$PIDFILE"
+
+    # Read and unset saved claude width(s)
+    if [[ "$WORKSPACE_MODE" == "true" ]]; then
+      # マルチプロジェクトモード: 各列の幅を削除
+      for var in $(tmux show-environment -t "$SESSION" 2>/dev/null | grep '^TPROJ_CLAUDE_WIDTH_P' | cut -d= -f1); do
+        tmux set-environment -u -t "$SESSION" "$var" 2>/dev/null || true
+      done
+    else
+      # 単一プロジェクトモード
+      tmux set-environment -u -t "$SESSION" TPROJ_CLAUDE_WIDTH 2>/dev/null || true
+    fi
+
+    if [[ "$WORKSPACE_MODE" == "true" ]]; then
+      # ワークスペースモード: 各列ごとに agent panes を削除（高さ比は保持しない）
+      for pane_info in $(tmux list-panes -t "$SESSION:dev" \
+        -F "#{pane_id}:#{@role}" 2>/dev/null); do
+        role="${pane_info#*:}"
+        pane_id="${pane_info%%:*}"
+        [[ -z "$role" ]] && continue
+        if [[ "$role" == agent-p*-* ]]; then
+          "$HOME/bin/tproj-kill-pane" "$pane_id" "$role" 2>/dev/null || true
+        fi
+      done
+    else
+      # 単一プロジェクトモード: 既存のロジック
+      # Capture current codex/yazi heights BEFORE killing agent panes
+      local codex_h=0 yazi_h=0
+      local pane_info role pane_id
+      for pane_info in $(tmux list-panes -t "$SESSION:dev" \
+        -F "#{pane_id}:#{@role}:#{pane_height}" 2>/dev/null); do
+        role=$(echo "$pane_info" | cut -d: -f2)
+        case "$role" in
+          codex) codex_h=$(echo "$pane_info" | cut -d: -f3) ;;
+          yazi)  yazi_h=$(echo "$pane_info" | cut -d: -f3) ;;
+        esac
+      done
+      local total_ratio=$(( codex_h + yazi_h ))
+
+      # Kill remaining agent panes
+      local protected="claude codex yazi"
+      for pane_info in $(tmux list-panes -t "$SESSION:dev" \
+        -F "#{pane_id}:#{@role}" 2>/dev/null); do
+        role="${pane_info#*:}"
+        pane_id="${pane_info%%:*}"
+        [[ " $protected " == *" $role "* ]] && continue
+        [[ -z "$role" ]] && continue
+        if [[ "$role" == agent-* ]]; then
+          "$HOME/bin/tproj-kill-pane" "$pane_id" "$role" 2>/dev/null || true
+        fi
+      done
+
+      # Wait for tmux to settle after pane removal
+      sleep 0.5
+
+      # Restore right-column pane heights using pre-cleanup ratio
+      if [[ "$total_ratio" -gt 0 ]]; then
+        # Get current codex+yazi total height (post agent removal)
+        local new_codex_h=0 new_yazi_h=0 codex_pid="" yazi_pid=""
+        for pane_info in $(tmux list-panes -t "$SESSION:dev" \
+          -F "#{pane_id}:#{@role}:#{pane_height}" 2>/dev/null); do
+          role=$(echo "$pane_info" | cut -d: -f2)
+          pane_id=$(echo "$pane_info" | cut -d: -f1)
+          case "$role" in
+            codex) new_codex_h=$(echo "$pane_info" | cut -d: -f3); codex_pid="$pane_id" ;;
+            yazi)  new_yazi_h=$(echo "$pane_info" | cut -d: -f3); yazi_pid="$pane_id" ;;
+          esac
+        done
+        local available=$(( new_codex_h + new_yazi_h ))
+
+        # Resize codex only; yazi gets the remaining space automatically
+        if [[ -n "$codex_pid" && "$available" -gt 0 ]]; then
+          local target_codex=$(( available * codex_h / total_ratio ))
+          [[ "$target_codex" -lt 1 ]] && target_codex=1
+          tmux resize-pane -t "$codex_pid" -y "$target_codex" 2>/dev/null || true
+        fi
+      fi
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  HAS_SEEN_AGENTS=false
+  declare -A DEAD_COUNTS   # agent_name -> consecutive missing count
+  DEAD_THRESHOLD=10        # 10 polls * 3s = 30s grace period
+  DEAD_FILE="/tmp/tproj-dead-agents"
+
+  while true; do
+    CURRENT_AGENTS=()
+
+    # Collect current team members from config.json
+    for config in "$TEAM_DIR"/*/config.json; do
+      [[ -f "$config" ]] || continue
+      while IFS= read -r name; do
+        [[ -n "$name" ]] && CURRENT_AGENTS+=("$name")
+      done < <(jq -r '.members[].name' "$config" 2>/dev/null)
+    done
+
+    # Resolve agent-pending panes: match to new team members
+    while IFS=: read -r pane_id role column; do
+      if [[ "$WORKSPACE_MODE" == "true" ]]; then
+        # ワークスペースモード: agent-p$COLUMN-pending を解決
+        [[ "$role" =~ ^agent-p([0-9]+)-pending$ ]] || continue
+        col="${BASH_REMATCH[1]}"
+
+        # Find a team member that doesn't have a pane in this column yet
+        for agent in "${CURRENT_AGENTS[@]}"; do
+          EXISTING=$(tmux list-panes -t "$SESSION:dev" \
+            -F '#{@role}' 2>/dev/null | grep -c "^agent-p${col}-${agent}$") || true
+          if [[ "$EXISTING" -eq 0 ]]; then
+            tmux set-option -pt "$pane_id" @role "agent-p${col}-$agent" 2>/dev/null || true
+            tmux select-pane -t "$pane_id" -T "$agent" 2>/dev/null || true
+            break
+          fi
+        done
+      else
+        # 単一プロジェクトモード: agent-pending を解決
+        [[ "$role" == "agent-pending" ]] || continue
+
+        # Find a team member that doesn't have a pane yet
+        for agent in "${CURRENT_AGENTS[@]}"; do
+          EXISTING=$(tmux list-panes -t "$SESSION:dev" \
+            -F '#{@role}' 2>/dev/null | grep -c "^agent-${agent}$") || true
+          if [[ "$EXISTING" -eq 0 ]]; then
+            tmux set-option -pt "$pane_id" @role "agent-$agent" 2>/dev/null || true
+            tmux select-pane -t "$pane_id" -T "$agent" 2>/dev/null || true
+            break
+          fi
+        done
+      fi
+    done < <(tmux list-panes -t "$SESSION:dev" -F '#{pane_id}:#{@role}:#{@column}' 2>/dev/null)
+
+    # Detect dead agents: in config but no tmux pane
+    PANE_ROLES=$(tmux list-panes -t "$SESSION:dev" -F '#{@role}' 2>/dev/null | grep '^agent-' || true)
+
+    if [[ "$WORKSPACE_MODE" == "true" ]]; then
+      HAS_PENDING=$(echo "$PANE_ROLES" | grep -c '^agent-p[0-9]\+-pending$' || true)
+    else
+      HAS_PENDING=$(echo "$PANE_ROLES" | grep -c '^agent-pending$' || true)
+    fi
+
+    DEAD_AGENTS=()
+
+    for agent in "${CURRENT_AGENTS[@]}"; do
+      agent_found=false
+
+      if [[ "$WORKSPACE_MODE" == "true" ]]; then
+        # ワークスペースモード: agent-p*-$agent を探す
+        if echo "$PANE_ROLES" | grep -q "^agent-p[0-9]\+-${agent}$"; then
+          agent_found=true
+        fi
+      else
+        # 単一プロジェクトモード: agent-$agent を探す
+        if echo "$PANE_ROLES" | grep -q "^agent-${agent}$"; then
+          agent_found=true
+        fi
+      fi
+
+      if [[ "$agent_found" == "true" ]]; then
+        DEAD_COUNTS["$agent"]=0
+      elif [[ "$HAS_PENDING" -gt 0 ]]; then
+        # Pending panes exist - agent may just be unresolved yet
+        DEAD_COUNTS["$agent"]=0
+      else
+        DEAD_COUNTS["$agent"]=$(( ${DEAD_COUNTS["$agent"]:-0} + 1 ))
+        if [[ ${DEAD_COUNTS["$agent"]} -ge $DEAD_THRESHOLD ]]; then
+          DEAD_AGENTS+=("$agent")
+        fi
+      fi
+    done
+
+    # Write/remove dead agents file for statusline
+    if [[ ${#DEAD_AGENTS[@]} -gt 0 ]]; then
+      printf '%s\n' "${DEAD_AGENTS[@]}" > "$DEAD_FILE"
+    else
+      rm -f "$DEAD_FILE"
+    fi
+
+    # Track if we've ever seen agents
+    if [[ ${#CURRENT_AGENTS[@]} -gt 0 ]]; then
+      HAS_SEEN_AGENTS=true
+    fi
+
+    # Exit when all agents are gone and no config remains
+    if [[ "$HAS_SEEN_AGENTS" == "true" && ${#CURRENT_AGENTS[@]} -eq 0 ]]; then
+      ls "$TEAM_DIR"/*/config.json &>/dev/null || break
+    fi
+
+    sleep 3
+  done
+) &
+disown

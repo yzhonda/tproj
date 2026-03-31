@@ -10,22 +10,31 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 DRY_RUN=false
 AUTO_YES=false
+CORE_ONLY=false
+WITH_MEMORY=false
+ALL_EXTENSIONS=false
 
 usage() {
   cat << 'EOF'
-tproj インストーラ
+tproj installer
 
-使い方: ./install.sh [OPTIONS]
+Usage: ./install.sh [OPTIONS]
 
-オプション:
-  -h, --help     このヘルプを表示
-  -n, --dry-run  実際の変更を行わずに表示
-  -y, --yes      確認なしで自動インストール
+Options:
+  -h, --help          Show this help
+  -n, --dry-run       Show what would be done without making changes
+  -y, --yes           Auto-yes (skip confirmations)
+  --core-only         Install core only (no extensions)
+  --with-memory       Include memory extension (cc-mem, memory-guard)
+  --all               Install all extensions including memory
 
-例:
-  ./install.sh           # 通常インストール
-  ./install.sh -n        # ドライラン（変更なし）
-  ./install.sh -y        # 確認なしで自動インストール
+By default, messaging + persona + agent-teams extensions are installed.
+Memory extension requires --with-memory or --all (runs a launchd daemon).
+
+Examples:
+  ./install.sh           # core + default extensions
+  ./install.sh --all     # everything including memory
+  ./install.sh --core-only  # minimal install
 EOF
   exit 0
 }
@@ -43,9 +52,22 @@ while [[ $# -gt 0 ]]; do
       AUTO_YES=true
       shift
       ;;
+    --core-only)
+      CORE_ONLY=true
+      shift
+      ;;
+    --with-memory)
+      WITH_MEMORY=true
+      shift
+      ;;
+    --all)
+      ALL_EXTENSIONS=true
+      WITH_MEMORY=true
+      shift
+      ;;
     *)
-      echo "❌ 不明なオプション: $1"
-      echo "   ヘルプ: ./install.sh -h"
+      echo "Unknown option: $1"
+      echo "   Help: ./install.sh -h"
       exit 1
       ;;
   esac
@@ -224,7 +246,7 @@ fi
 # ========== 4. バックアップ & コピー ==========
 
 # 4.1 tproj スクリプト
-CORE_BINS=(tproj tproj-drop-column tproj-kill-pane tproj-toggle-yazi tproj-pane-focus-hook tproj-pane-clear-rank tproj-pane-watchdog tproj-respawn-guard tproj-postmortem tproj-mem-trace agent-monitor team-watcher reflow-agent-pane rebalance-workspace-columns sign-codex wait-for-pane-text)
+CORE_BINS=(tproj tproj-drop-column tproj-kill-pane tproj-toggle-yazi tproj-pane-focus-hook tproj-pane-clear-rank tproj-pane-watchdog tproj-respawn-guard tproj-postmortem tproj-mem-trace rebalance-workspace-columns sign-codex wait-for-pane-text)
 
 if $DRY_RUN; then
   for bin_name in "${CORE_BINS[@]}"; do
@@ -331,22 +353,109 @@ if [[ ":$PATH:" != *":$HOME/bin:"* ]]; then
   fi
 fi
 
-# ========== 6. 完了メッセージ ==========
+# ========== 6. Extensions ==========
+
+if ! $CORE_ONLY; then
+  echo ""
+  echo "📦 Installing extensions..."
+  mkdir -p ~/bin
+
+  # --- messaging ---
+  if [[ -d "$SCRIPT_DIR/extensions/messaging" ]]; then
+    echo "  📦 messaging (tproj-msg)"
+    if ! $DRY_RUN; then
+      cp "$SCRIPT_DIR/extensions/messaging/tproj-msg" ~/bin/
+      chmod +x ~/bin/tproj-msg
+      # Install msg skill if Claude Code skills dir exists
+      if [[ -d "$HOME/.claude/skills" ]]; then
+        mkdir -p "$HOME/.claude/skills/msg"
+        cp "$SCRIPT_DIR/extensions/messaging/skill-msg/SKILL.md" "$HOME/.claude/skills/msg/"
+      fi
+    else
+      echo "    [DRY-RUN] tproj-msg -> ~/bin/"
+    fi
+  fi
+
+  # --- persona ---
+  if [[ -d "$SCRIPT_DIR/extensions/persona" ]]; then
+    echo "  📦 persona (cc-persona, tproj-pane-bg)"
+    if ! $DRY_RUN; then
+      cp "$SCRIPT_DIR/extensions/persona/cc-persona" ~/bin/
+      cp "$SCRIPT_DIR/extensions/persona/tproj-pane-bg" ~/bin/
+      chmod +x ~/bin/cc-persona ~/bin/tproj-pane-bg
+    else
+      echo "    [DRY-RUN] cc-persona, tproj-pane-bg -> ~/bin/"
+    fi
+    # Check optional deps
+    if ! command -v jq &>/dev/null; then
+      echo "    ⚠️  jq not found (required by cc-persona): brew install jq"
+    fi
+    if ! python3 -c "import genai" 2>/dev/null; then
+      echo "    ℹ️  google-genai not found (optional, for AI image generation): pip3 install google-genai"
+    fi
+  fi
+
+  # --- agent-teams ---
+  if [[ -d "$SCRIPT_DIR/extensions/agent-teams" ]]; then
+    echo "  📦 agent-teams (team-watcher, reflow-agent-pane, agent-monitor)"
+    if ! $DRY_RUN; then
+      for ext_bin in team-watcher reflow-agent-pane agent-monitor; do
+        cp "$SCRIPT_DIR/extensions/agent-teams/$ext_bin" ~/bin/
+        chmod +x ~/bin/"$ext_bin"
+      done
+    else
+      echo "    [DRY-RUN] team-watcher, reflow-agent-pane, agent-monitor -> ~/bin/"
+    fi
+  fi
+
+  # --- memory (opt-in) ---
+  if $WITH_MEMORY && [[ -d "$SCRIPT_DIR/extensions/memory" ]]; then
+    echo "  📦 memory (cc-mem, memory-guard, tproj-mem-json)"
+    if ! $DRY_RUN; then
+      cp "$SCRIPT_DIR/extensions/memory/cc-mem" ~/bin/
+      cp "$SCRIPT_DIR/extensions/memory/memory-guard" ~/bin/
+      cp "$SCRIPT_DIR/extensions/memory/tproj-mem-json" ~/bin/
+      chmod +x ~/bin/cc-mem ~/bin/memory-guard ~/bin/tproj-mem-json
+
+      # Install launchd plist for memory-guard
+      if [[ -f "$SCRIPT_DIR/extensions/memory/launchd/com.tproj.memory-guard.plist.template" ]]; then
+        PLIST_DIR="$HOME/Library/LaunchAgents"
+        PLIST_FILE="$PLIST_DIR/com.tproj.memory-guard.plist"
+        mkdir -p "$PLIST_DIR"
+        sed "s|\${HOME}|$HOME|g" "$SCRIPT_DIR/extensions/memory/launchd/com.tproj.memory-guard.plist.template" > "$PLIST_FILE"
+        launchctl bootout "gui/$(id -u)/com.tproj.memory-guard" 2>/dev/null || true
+        launchctl bootstrap "gui/$(id -u)" "$PLIST_FILE" 2>/dev/null || true
+        echo "    ✅ memory-guard launchd daemon installed"
+      fi
+    else
+      echo "    [DRY-RUN] cc-mem, memory-guard, tproj-mem-json -> ~/bin/"
+      echo "    [DRY-RUN] memory-guard launchd plist -> ~/Library/LaunchAgents/"
+    fi
+  elif ! $WITH_MEMORY && [[ -d "$SCRIPT_DIR/extensions/memory" ]]; then
+    echo "  ⏭️  memory (skipped, use --with-memory or --all to install)"
+  fi
+fi
+
+# ========== 7. 完了メッセージ ==========
 
 echo ""
 if $DRY_RUN; then
-  echo "✅ ドライラン完了（実際の変更はありません）"
+  echo "✅ Dry run complete (no changes made)"
   echo ""
-  echo "実行するには: ./install.sh"
+  echo "Run for real: ./install.sh"
 else
-  echo "✅ インストール完了!"
+  echo "✅ Installation complete!"
 fi
 
 echo ""
 echo "Installed to:"
-echo "   ~/bin/ (core scripts)"
-echo "   ~/.tmux.conf"
-echo "   ~/.config/yazi/"
+echo "   ~/bin/            core scripts"
+echo "   ~/.tmux.conf      tmux configuration"
+echo "   ~/.config/yazi/   yazi file manager"
+if ! $CORE_ONLY; then
+  echo "   ~/bin/            extensions (messaging, persona, agent-teams)"
+  $WITH_MEMORY && echo "   ~/bin/            memory extension (cc-mem, memory-guard)"
+fi
 echo ""
 echo "Usage:"
 echo "   Single project: cd <project> && tproj"

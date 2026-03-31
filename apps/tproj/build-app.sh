@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$ROOT_DIR/../.." && pwd)"
 APP_NAME="tproj"
-BUNDLE_ID="com.usedhonda.tproj.desktop"
+BUNDLE_ID="${BUNDLE_ID:-com.tproj.desktop}"
 APP_VERSION="${APP_VERSION:-0.1.0}"
 BUNDLE_VERSION="${BUNDLE_VERSION:-1}"
 DIST_DIR="$ROOT_DIR/dist"

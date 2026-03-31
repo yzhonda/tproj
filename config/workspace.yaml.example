@@ -100,16 +100,10 @@
 #       required: false
 #       hint: brew install yq
 #
-#   # ClawGate bridge connection for tproj-msg gate targets
+#   # External bridge for inter-pane messaging (optional, used by tproj-msg)
 #   bridge:
 #     url: http://localhost:8765    # Bridge server URL
-#     default_adapter: direct       # Default adapter (see below)
-#   #
-#   # Adapter types:
-#   #   direct  - /v1/debug/inject -> EventBus injection -> Chi polls via /v1/poll
-#   #             Chi receives [tproj-msg:sender=ALIAS.ROLE,project=ALIAS] header
-#   #   line    - /v1/send adapter=line -> LINE message to user
-#   #   tmux    - /v1/send adapter=tmux -> send-keys to CC pane (requires autonomous mode)
+#     default_adapter: direct       # Default adapter
 
 # ===== Detailed format (local + remote) =====
 
@@ -124,10 +118,10 @@ projects:
     enabled: false   # GUI Stop remembers the current manual-Start set by rewriting enabled
 
   # Remote project over SSH
-  - path: /Users/<username>/projects/others/openclaw_general
+  - path: /Users/<username>/projects/my-api-server
     type: remote
     host: remote-host
-    alias: openclaw
+    alias: api
 
 # ===== Field reference =====
 #

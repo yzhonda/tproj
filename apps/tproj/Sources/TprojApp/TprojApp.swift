@@ -672,7 +672,7 @@ final class GhosttyWindowTracker: ObservableObject {
         abs(lhs.x - rhs.x) < 0.5 && abs(lhs.y - rhs.y) < 0.5
     }
 
-    // MARK: Anchored origin (ClawGate-style direct calculation)
+    // MARK: Anchored origin (anchor-based direct calculation)
 
     private func anchoredOrigin(
         for ghosttyFrame: CGRect,

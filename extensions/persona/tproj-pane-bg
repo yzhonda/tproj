@@ -1,0 +1,2851 @@
+#!/bin/bash
+set -euo pipefail
+
+# Prefer homebrew python3 (has google-genai) over system python3
+[[ -d /opt/homebrew/bin ]] && export PATH="/opt/homebrew/bin:$PATH"
+
+PROGRAM_NAME="$(basename "$0")"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")"
+FLASH_MODEL_NAME="gemini-2.5-flash-image"
+PRO_MODEL_NAME="gemini-3-pro-image-preview"
+CC_PERSONA_BIN="/Users/usedhonda/bin/cc-persona"
+FLASH_PROMPT_VERSION="2026-03-09.ghibli.era-action.v15"
+PRO_PROMPT_VERSION="2026-03-09.nanobanana-pro-prose.v15"
+PERSONA_SOURCE_VERSION="2026-03-07.role-fixed-gender.v1"
+FLASH_PROMPT_SCHEMA="legacy-prose-v1"
+PRO_PROMPT_SCHEMA="nanobanana-pro-self-contained-v2"
+STYLE_MODE_NAMED="named"
+STYLE_MODE_FALLBACK="descriptor"
+STYLE_REFERENCE="Studio Ghibli"
+STYLE_REFERENCE_FALLBACK="hand-painted theatrical anime"
+ASPECT_RATIO="9:16"
+TARGET_WIDTH="1024"
+TARGET_HEIGHT="1536"
+MAX_GENERATION_ATTEMPTS="${TPROJ_PANE_BG_MAX_ATTEMPTS:-1}"
+REQUEST_TIMEOUT_SECONDS="${TPROJ_PANE_BG_REQUEST_TIMEOUT_SECONDS:-60}"
+WORK_ROOT="/tmp/tproj-pane-bg"
+CURRENT_MANIFEST="${WORK_ROOT}/current.json"
+DEFAULT_OPACITY="0.94"
+FACE_CROP_POLICY="vision-face-center-v1"
+FACE_CROP_TARGET_FACE_HEIGHT_RATIO="0.24"
+FACE_CROP_MAX_ZOOM="1.75"
+FACE_CROP_CENTER_TOLERANCE="0.03"
+FACE_CROP_MAX_ABS_ROLL_RADIANS="0.7853981633974483"
+LAST_FACE_CROP_JSON='null'
+LAST_GENERATION_ERROR_JSON='null'
+
+if ! [[ "$MAX_GENERATION_ATTEMPTS" =~ ^[1-9][0-9]*$ ]]; then
+  MAX_GENERATION_ATTEMPTS="1"
+fi
+
+if ! [[ "$REQUEST_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+  REQUEST_TIMEOUT_SECONDS="90"
+fi
+
+usage() {
+  cat <<'EOF'
+Usage:
+  tproj-pane-bg --session <name> [--window <name>] [--mode <single|workspace>]
+  tproj-pane-bg generate --project <path> --role cc|cdx [--refresh]
+  tproj-pane-bg sync --session <name>
+
+Commands:
+  generate   Generate or reuse a cached vertical wallpaper for cc/cdx.
+  sync       Collect tmux pane geometry, refresh the manifest, and install hooks.
+EOF
+}
+
+die() {
+  echo "${PROGRAM_NAME}: $*" >&2
+  exit 1
+}
+
+warn() {
+  echo "${PROGRAM_NAME}: $*" >&2
+}
+
+trim() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+now_utc() {
+  date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+safe_name() {
+  printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'
+}
+
+hash_string() {
+  printf '%s' "$1" | shasum -a 256 | awk '{print $1}'
+}
+
+decode_base64_to_file() {
+  local encoded="$1"
+  local out_path="$2"
+  if base64 --help 2>&1 | grep -q -- '--decode'; then
+    printf '%s' "$encoded" | base64 --decode > "$out_path"
+  else
+    printf '%s' "$encoded" | base64 -D > "$out_path"
+  fi
+}
+
+single_quote_escape() {
+  printf '%s' "$1" | sed "s/'/'\\\\''/g"
+}
+
+normalize_dir() {
+  local path="$1"
+  if [[ -d "$path" ]]; then
+    (cd "$path" && pwd -P)
+    return 0
+  fi
+  return 1
+}
+
+detect_project_root() {
+  local path="$1"
+  if git -C "$path" rev-parse --show-toplevel >/dev/null 2>&1; then
+    git -C "$path" rev-parse --show-toplevel
+  else
+    normalize_dir "$path"
+  fi
+}
+
+project_cache_dir() {
+  printf '%s/.local/tproj-pane-bg' "$1"
+}
+
+project_image_path() {
+  local project="$1"
+  local role="$2"
+  printf '%s/%s.vertical.png' "$(project_cache_dir "$project")" "$role"
+}
+
+project_meta_path() {
+  local project="$1"
+  local role="$2"
+  printf '%s/%s.vertical.json' "$(project_cache_dir "$project")" "$role"
+}
+
+runtime_placeholder_path() {
+  local role="$1"
+  printf '%s/fallback-%s.png' "$WORK_ROOT" "$role"
+}
+
+hook_log_path() {
+  local session="$1"
+  printf '%s/hook.%s.log' "$WORK_ROOT" "$(safe_name "$session")"
+}
+
+generation_retry_lock_dir() {
+  local session="$1"
+  local project="$2"
+  local role="$3"
+  printf '%s/retry.%s.%s.%s.lock' "$WORK_ROOT" "$(safe_name "$session")" "$(safe_name "$project")" "$role"
+}
+
+generation_lock_dir() {
+  local project="$1"
+  printf '%s/generate.%s.lock' "$WORK_ROOT" "$(safe_name "$project")"
+}
+
+ensure_runtime_placeholder() {
+  local role="$1"
+  local out_path=""
+  local base_gradient=""
+  local overlay_gradient=""
+  local glow_color=""
+  local accent_color=""
+  local tmp_path=""
+
+  out_path="$(runtime_placeholder_path "$role")"
+  [[ -s "$out_path" ]] && {
+    printf '%s\n' "$out_path"
+    return 0
+  }
+
+  command -v magick >/dev/null 2>&1 || return 1
+  mkdir -p "$WORK_ROOT"
+  tmp_path="${out_path}.tmp.png"
+
+  case "$role" in
+    cc)
+      base_gradient="#3f2b35-#b88b92"
+      overlay_gradient="#f4ddd3-#00000000"
+      glow_color="#f9e8e0aa"
+      accent_color="#f3cbbd66"
+      ;;
+    cdx|*)
+      base_gradient="#213346-#6d8da9"
+      overlay_gradient="#dce8f4-#00000000"
+      glow_color="#e7f2ffaa"
+      accent_color="#bed7f766"
+      ;;
+  esac
+
+  if ! magick \
+    -size "${TARGET_WIDTH}x${TARGET_HEIGHT}" "gradient:${base_gradient}" \
+    \( -size "${TARGET_WIDTH}x${TARGET_HEIGHT}" "radial-gradient:${overlay_gradient}" -alpha set -channel A -evaluate multiply 0.50 +channel \) -compose screen -composite \
+    \( -size "${TARGET_WIDTH}x${TARGET_HEIGHT}" xc:none -fill "${glow_color}" -draw "ellipse 512,700 210,320 0,360" -blur 0x80 \) -compose over -composite \
+    \( -size "${TARGET_WIDTH}x${TARGET_HEIGHT}" xc:none -fill "${accent_color}" -draw "ellipse 512,1020 360,260 0,360" -blur 0x110 \) -compose screen -composite \
+    -strip "$tmp_path" >/dev/null 2>&1; then
+    rm -f "$tmp_path"
+    return 1
+  fi
+
+  mv "$tmp_path" "$out_path"
+  printf '%s\n' "$out_path"
+}
+
+ensure_all_runtime_placeholders() {
+  ensure_runtime_placeholder "cc" >/dev/null 2>&1 || true
+  ensure_runtime_placeholder "cdx" >/dev/null 2>&1 || true
+}
+
+api_key_or_empty() {
+  if [[ -n "${GEMINI_API_KEY:-}" ]]; then
+    printf '%s' "${GEMINI_API_KEY}"
+    return 0
+  fi
+  if [[ -n "${GOOGLE_API_KEY:-}" ]]; then
+    printf '%s' "${GOOGLE_API_KEY}"
+    return 0
+  fi
+  printf ''
+}
+
+vertex_project_or_empty() {
+  if [[ -n "${GOOGLE_CLOUD_PROJECT:-}" ]]; then
+    printf '%s' "${GOOGLE_CLOUD_PROJECT}"
+    return 0
+  fi
+  printf ''
+}
+
+vertex_location_or_default() {
+  if [[ -n "${GOOGLE_CLOUD_LOCATION:-}" ]]; then
+    printf '%s' "${GOOGLE_CLOUD_LOCATION}"
+    return 0
+  fi
+  printf 'global'
+}
+
+session_env_value() {
+  local session="$1"
+  local key="$2"
+  local line=""
+
+  line="$(tmux show-environment -t "$session" 2>/dev/null | awk -F= -v key="$key" '$1 == key {sub($1 "=",""); print; exit}')"
+  printf '%s' "$line"
+}
+
+prime_session_api_env() {
+  local session="$1"
+
+  if [[ -n "${GEMINI_API_KEY:-}" ]]; then
+    tmux set-environment -t "$session" GEMINI_API_KEY "$GEMINI_API_KEY" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${GOOGLE_API_KEY:-}" ]]; then
+    tmux set-environment -t "$session" GOOGLE_API_KEY "$GOOGLE_API_KEY" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${GOOGLE_CLOUD_PROJECT:-}" ]]; then
+    tmux set-environment -t "$session" GOOGLE_CLOUD_PROJECT "$GOOGLE_CLOUD_PROJECT" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${GOOGLE_CLOUD_LOCATION:-}" ]]; then
+    tmux set-environment -t "$session" GOOGLE_CLOUD_LOCATION "$GOOGLE_CLOUD_LOCATION" >/dev/null 2>&1 || true
+  fi
+}
+
+hydrate_api_env_from_session() {
+  local session="$1"
+  local session_gemini=""
+  local session_google=""
+  local session_project=""
+  local session_location=""
+
+  if [[ -z "${GEMINI_API_KEY:-}" ]]; then
+    session_gemini="$(session_env_value "$session" GEMINI_API_KEY)"
+    if [[ -n "$session_gemini" ]]; then
+      export GEMINI_API_KEY="$session_gemini"
+    fi
+  fi
+
+  if [[ -z "${GOOGLE_API_KEY:-}" ]]; then
+    session_google="$(session_env_value "$session" GOOGLE_API_KEY)"
+    if [[ -n "$session_google" ]]; then
+      export GOOGLE_API_KEY="$session_google"
+    fi
+  fi
+
+  if [[ -z "${GOOGLE_CLOUD_PROJECT:-}" ]]; then
+    session_project="$(session_env_value "$session" GOOGLE_CLOUD_PROJECT)"
+    if [[ -n "$session_project" ]]; then
+      export GOOGLE_CLOUD_PROJECT="$session_project"
+    fi
+  fi
+
+  if [[ -z "${GOOGLE_CLOUD_LOCATION:-}" ]]; then
+    session_location="$(session_env_value "$session" GOOGLE_CLOUD_LOCATION)"
+    if [[ -n "$session_location" ]]; then
+      export GOOGLE_CLOUD_LOCATION="$session_location"
+    fi
+  fi
+}
+
+role_label() {
+  case "$1" in
+    cc) printf 'CC' ;;
+    cdx) printf 'CDX' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+classify_tmux_role() {
+  local role_value="$1"
+  case "$role_value" in
+    cc|claude|claude-*|cc-*) printf 'cc' ;;
+    cdx|codex|codex-*|cdx-*) printf 'cdx' ;;
+    *) return 1 ;;
+  esac
+}
+
+translate_gender() {
+  local raw="$1"
+  case "$raw" in
+    "女") printf '女性' ;;
+    "男") printf '男性' ;;
+    *) printf '人物' ;;
+  esac
+}
+
+translate_age() {
+  local raw="$1"
+  case "$raw" in
+    "10代"|"20代"|"30代"|"40代"|"50代") printf '%s' "$raw" ;;
+    *) printf '成人' ;;
+  esac
+}
+
+persona_subject_jp() {
+  local gender_raw="$1"
+  local age_raw="$2"
+  case "${age_raw}:${gender_raw}" in
+    "10代:男") printf '10代の少年' ;;
+    "10代:女") printf '10代後半の若い女性' ;;
+    "20代:男") printf '20代の青年' ;;
+    "20代:女") printf '20代の女性' ;;
+    "30代:男") printf '30代の男性' ;;
+    "30代:女") printf '30代の女性' ;;
+    "40代:男") printf '40代の男性' ;;
+    "40代:女") printf '40代の女性' ;;
+    "50代:男") printf '50代の男性' ;;
+    "50代:女") printf '50代の女性' ;;
+    *) printf '%s' "$(translate_gender "$gender_raw")" ;;
+  esac
+}
+
+extract_value_after_colon() {
+  local line="$1"
+  trim "${line#*:}"
+}
+
+extract_hint() {
+  local value="$1"
+  if [[ "$value" == *'('*')' ]]; then
+    local hint="${value#*\(}"
+    printf '%s' "${hint%\)}"
+  else
+    printf ''
+  fi
+}
+
+extract_label_value() {
+  local value="$1"
+  if [[ "$value" == *'('*')' ]]; then
+    printf '%s' "$(trim "${value% (*}")"
+  else
+    printf '%s' "$(trim "$value")"
+  fi
+}
+
+reset_persona_globals() {
+  PERSONA_ROLE=""
+  PERSONA_MBTI=""
+  PERSONA_GENDER_RAW=""
+  PERSONA_AGE_RAW=""
+  PERSONA_ERA=""
+  PERSONA_ERA_HINT=""
+  PERSONA_TONE=""
+  PERSONA_TONE_HINT=""
+  PERSONA_CHI_REL=""
+  PERSONA_CHI_HINT=""
+  PERSONA_MASTER_REL=""
+  PERSONA_MASTER_HINT=""
+  PERSONA_CALLNAME=""
+  PERSONA_CHARA=""
+  PERSONA_CHARA_HINT=""
+  PERSONA_VISUAL_AGE=""
+  PERSONA_EXPRESSION_MODE=""
+  PERSONA_POSE_MODE=""
+  PERSONA_PROP_MODE=""
+}
+
+describe_era_hint() {
+  case "$1" in
+    "古代ギリシャ") printf '白い石柱、青い海風、明るい日差し、青銅の光がある古代ギリシャの空気' ;;
+    "戦国") printf '木と漆、薄い煙、張り詰めた気配、武家の実務が残る戦国の空気' ;;
+    "大航海時代") printf '潮風、帆布、真鍮、ロープ、水平線の光が混ざる大航海時代の空気' ;;
+    "江戸") printf '和紙、木格子、障子越しの光、静かな町家や武家屋敷の江戸の空気' ;;
+    "昭和レトロ") printf '白熱灯、木の机、柔らかな布、少し懐かしい昭和レトロの空気' ;;
+    "サイバーパンク") printf '雨上がりの発光、配線、濡れた路面、都市の熱が残るサイバーパンクの空気' ;;
+    "近未来") printf '清潔な発光面、曲面パネル、静かな機能美がある近未来の空気' ;;
+    "宇宙開拓時代") printf '船体のハッチ、作業灯、星の反射、開拓前線の宇宙港の空気' ;;
+    "終末世界") printf '風化した金属、防塵布、補修跡、乾いた風が吹く終末世界の空気' ;;
+    "魔法世界") printf '石造りの工房、浮遊する灯り、木と真鍮、魔法の気配が漂う空気' ;;
+    *) printf '%sの人物が自然に暮らしていそうな、その時代固有の空気' "$1" ;;
+  esac
+}
+
+describe_tone_hint() {
+  case "$1" in
+    "丁寧") printf '穏やかで礼儀正しく、安心感がある' ;;
+    "ぶっきらぼう") printf '無愛想で率直、しかし有能で手際が良い' ;;
+    "詩的") printf '静かで詩的、柔らかいが芯がある' ;;
+    "論理的") printf '理知的で迷いが少なく、判断が速い' ;;
+    "感情的") printf '熱量が高く、表情が素直に動く' ;;
+    "皮肉屋") printf '少し斜に構えつつも観察眼が鋭い' ;;
+    *) printf '%sな性格が一目で伝わる' "$1" ;;
+  esac
+}
+
+describe_master_hint() {
+  case "$1" in
+    "忠犬的") printf 'すぐ動く忠実さと前向きな献身がある' ;;
+    "参謀的") printf '優しく見えても一歩引いて全体を読んでいる参謀役' ;;
+    "執事的") printf '仕える者としてきっちり振る舞うが、自分の流儀も強い' ;;
+    "崇拝的") printf '憧れと敬意が強く、少し神聖視している' ;;
+    "甘えん坊") printf '距離感が近く、感情を素直に出す' ;;
+    "騎士的") printf '守る者として胸を張り、誇り高く振る舞う' ;;
+    *) printf '%sな関係性がにじむ' "$1" ;;
+  esac
+}
+
+describe_chara_hint() {
+  case "$1" in
+    "天然系") printf '少し天然で隙があるのに、肝心なところで鋭い' ;;
+    "小悪魔系") printf '遊び心が強く、相手を試すような余裕がある' ;;
+    "中二病系") printf '大げさな美意識と秘密主義が混ざる' ;;
+    "妖艶系") printf '落ち着いた艶やかさと余裕がある' ;;
+    "腹黒系") printf '表面は柔らかいのに、内側では計算が速い' ;;
+    "姐御肌系") printf '面倒見がよく、主導権を握る強さがある' ;;
+    "破天荒系") printf '規律の内側に、今にも逸脱しそうな危うい遊び心がある' ;;
+    "魔性系") printf '強い魅力と自信で空気を支配する' ;;
+    *) printf '%sらしさが姿勢と表情に出ている' "$1" ;;
+  esac
+}
+
+visual_age_value() {
+  local role="$1"
+  case "${role}:${PERSONA_AGE_RAW}:${PERSONA_GENDER_RAW}" in
+    "cc:10代:女") printf '15-19' ;;
+    "cc:20代:女") printf '20-25' ;;
+    "cc:30代:女") printf '25' ;;
+    "cdx:10代:男") printf '10代後半' ;;
+    "cdx:20代:男") printf '20代' ;;
+    "cdx:30代:男") printf '30代' ;;
+    "cdx:40代:男") printf '40代' ;;
+    "cdx:50代:男") printf '50代' ;;
+    *) printf '%s' "$PERSONA_AGE_RAW" ;;
+  esac
+}
+
+visual_age_prompt_jp() {
+  case "$PERSONA_VISUAL_AGE" in
+    "15-19") printf '見た目年齢は15歳から19歳ほどの若い女性として描く。子ども化せず、瑞々しさと芯の強さを両立させる' ;;
+    "20-25") printf '見た目年齢は20歳から25歳ほどの若い女性として描く。若さはあるが幼くしすぎず、自立した雰囲気を持たせる' ;;
+    "25") printf '見た目年齢は25歳前後の若い女性として描く。落ち着きはあるが老けさせない' ;;
+    "10代後半") printf '見た目年齢は10代後半の若い男性として描く。少年らしさと芯の強さを両立させる' ;;
+    "20代") printf '20代の若い男性として自然に描く' ;;
+    "30代") printf '30代の男性として自然に描く' ;;
+    "40代") printf '40代の男性として自然に描く' ;;
+    "50代") printf '50代の男性として自然に描く' ;;
+    *) printf '%sとして自然に描く' "$(persona_subject_jp "$PERSONA_GENDER_RAW" "$PERSONA_AGE_RAW")" ;;
+  esac
+}
+
+expression_mode_value() {
+  case "$PERSONA_TONE" in
+    "丁寧") printf 'gentle-smile' ;;
+    "ぶっきらぼう") printf 'sharp-stare' ;;
+    "詩的") printf 'soft-smile' ;;
+    "論理的") printf 'focused-gaze' ;;
+    "感情的") printf 'bright-emotion' ;;
+    "皮肉屋") printf 'wry-smirk' ;;
+    *) printf 'composed' ;;
+  esac
+}
+
+expression_prompt_jp() {
+  case "$PERSONA_TONE" in
+    "丁寧") printf '表情は穏やかな笑顔。目元はやさしく、相手を安心させる' ;;
+    "ぶっきらぼう") printf '表情は少し険しいが魅力のある真顔か、口元だけがわずかに動く不敵な表情。目線は鋭く外さない' ;;
+    "詩的") printf '表情は柔らかな笑み。目元に余韻があり、少し物思いに沈む' ;;
+    "論理的") printf '表情は集中していて、判断の速さが目に出る。微笑みは控えめ' ;;
+    "感情的") printf '表情は生き生きとした笑顔か、感情の熱が伝わるはっきりした目元' ;;
+    "皮肉屋") printf '表情は片眉が少し上がった皮肉な笑み。余裕と観察眼を感じさせる' ;;
+    *) printf '表情は人物の性格が一目で分かるように豊かにする' ;;
+  esac
+}
+
+pose_mode_value() {
+  case "$PERSONA_MASTER_REL" in
+    "忠犬的") printf 'forward-lean' ;;
+    "執事的") printf 'formal-ready' ;;
+    "崇拝的") printf 'reverent-open' ;;
+    "甘えん坊") printf 'close-warm' ;;
+    "騎士的") printf 'guarded-proud' ;;
+    "参謀的") printf 'thinking-hand' ;;
+    *) printf 'balanced' ;;
+  esac
+}
+
+pose_prompt_jp() {
+  case "$PERSONA_MASTER_REL" in
+    "忠犬的") printf '肩と上半身は少し前へ。今すぐ動ける前向きな所作にする' ;;
+    "執事的") printf '背筋は伸ばしつつ、片手はすぐ実務に移れる構えにする。形式だけで固めず、実際に働く人の姿勢にする' ;;
+    "崇拝的") printf '胸元を開き、憧れを向けるような上向きの気配を少し入れる' ;;
+    "甘えん坊") printf '距離の近い親しみを出し、肩と首の角度をやわらかくする' ;;
+    "騎士的") printf '胸を張り、守る側の姿勢を取る。片腕や肩に軽い構えを入れる' ;;
+    "参謀的") printf '片手を顎や口元、あるいは視線の先へ軽く動かし、考えながら助言している所作にする' ;;
+    *) printf '上半身に角度をつけ、静止した証明写真にしない' ;;
+  esac
+}
+
+motion_prompt_jp() {
+  case "$PERSONA_CHARA" in
+    "天然系") printf '手のひらや指先に少し無防備で柔らかな動きを入れる' ;;
+    "小悪魔系") printf '視線と指先に遊び心を入れ、相手を試すような仕草にする' ;;
+    "中二病系") printf '肩や指先に芝居がかった強さを入れ、秘密を抱えたような構えにする' ;;
+    "妖艶系") printf '手首や首筋の角度を美しく見せ、落ち着いた誘引力を出す' ;;
+    "腹黒系") printf '笑顔はやわらかく、目だけが先を読んでいるようにする' ;;
+    "姐御肌系") printf '肩を大きく開き、相手を導くような頼もしさを出す' ;;
+    "破天荒系") printf '肩のひねりや手の振りに勢いを入れ、今にも動き出しそうな危うさを出す' ;;
+    "魔性系") printf '視線と口元に強い主導権を持たせ、空気を支配するようにする' ;;
+    *) printf '表情だけでなく肩と手にも性格の動きを入れる' ;;
+  esac
+}
+
+prop_mode_value() {
+  case "$PERSONA_ERA" in
+    "古代ギリシャ") printf 'bronze-disc' ;;
+    "戦国") printf 'lacquer-hilt' ;;
+    "大航海時代") printf 'spyglass' ;;
+    "江戸") printf 'plain-fan' ;;
+    "昭和レトロ") printf 'lamp-or-cup' ;;
+    "サイバーパンク") printf 'glow-baton' ;;
+    "近未来") printf 'smooth-device' ;;
+    "宇宙開拓時代") printf 'helmet-or-tool' ;;
+    "終末世界") printf 'repair-tool' ;;
+    "魔法世界") printf 'wand' ;;
+    *) printf 'hand-prop' ;;
+  esac
+}
+
+prop_prompt_jp() {
+  case "$PERSONA_ERA" in
+    "古代ギリシャ") printf '片手に青銅の円盤や輪状の器具を持たせる。刻字は入れない' ;;
+    "戦国") printf '片手に扇だけへ固定しない。無地の短い組紐、漆の小箱、布包み、小さな香袋、柄だけが見える武具など、文字も家紋もない和小物を一つ持たせる' ;;
+    "大航海時代") printf '片手に小型の望遠鏡やロープを持たせ、海風を受ける' ;;
+    "江戸") printf '扇だけへ固定しない。櫛、巾着、かんざし、香袋、布包み、小さな漆器など、文字のない和小物を一つ持たせ、袖の動きが見えるようにする' ;;
+    "昭和レトロ") printf '片手に白いカップや小さなランプを持たせ、生活感を出す' ;;
+    "サイバーパンク") printf '片手に文字の出ない発光バトンや透明な光片を持たせる' ;;
+    "近未来") printf '片手に無文字の滑らかな機器や発光モジュールを持たせる' ;;
+    "宇宙開拓時代") printf '片手にヘルメットか作業工具を持たせ、前線感を出す' ;;
+    "終末世界") printf '片手に補修工具や布巻きの道具を持たせる' ;;
+    "魔法世界") printf '片手に杖をしっかり構え、微かな光だけを添える。ルーンや文字は入れない' ;;
+    *) printf '片手に文字の無い小道具を持たせる' ;;
+  esac
+}
+
+female_expression_presence_prompt_jp() {
+  [[ "$PERSONA_ROLE" == "cc" && "$PERSONA_GENDER_RAW" == "女" ]] || return 0
+  if [[ "$PERSONA_VISUAL_AGE" == "15-19" ]]; then
+    case "$PERSONA_CHARA" in
+      "妖艶系"|"魔性系") printf '表情は年相応の落ち着きと自信を持たせつつ、危うい大人びた色気ではなく、目元の強さと華やかな引力で見せる' ;;
+      "天然系") printf '表情は柔らかく可憐にし、無防備さの中に年相応の愛らしさと快活さ、仕事の楽しさをにじませる' ;;
+      "姐御肌系") printf '表情は頼もしさを保ちつつ、口元に余裕と親しみやすい華やかさを少し入れる。硬い無表情にしない' ;;
+      *)
+        case "$PERSONA_TONE" in
+          "丁寧") printf '表情は穏やかな笑みを保ちつつ、年相応の上品さとやさしさを出す。好きな仕事に向き合う嬉しさを目元へ残す' ;;
+          "詩的") printf '表情は余韻のある柔らかな笑みにし、静かな憂いよりも年相応の透明感と幸福感を大切にする' ;;
+          "感情的") printf '表情は明るく華やかにし、生命力と素直な熱を見せる。嬉しさがすぐ顔に出るようにする' ;;
+          "皮肉屋") printf '表情は余裕のある半笑いにし、挑発ではなく生意気な知性と華やかさで見せる。冷えた顔にはしない' ;;
+          *) printf '表情は女性らしいやわらかさを保ちつつ、年相応の快活さと引力が自然に出るようにする。働ける幸福感を笑みに残す' ;;
+        esac
+        ;;
+    esac
+    return 0
+  fi
+  case "$PERSONA_CHARA" in
+    "妖艶系") printf '表情は落ち着いた艶を持つ微笑みに寄せ、目元と口元に静かな引力をにじませる。仕事のできる余裕と幸福感を同時に見せる' ;;
+    "魔性系") printf '表情は相手を惹きつける自信あるまなざしにし、目元と口元に強い引力を持たせる。高圧的ではなく、満ちた気分で見せる' ;;
+    "天然系") printf '表情は柔らかく可憐にし、無防備さの中に自然な愛らしさとほのかなときめきをにじませる。嬉しさが隠しきれない空気を足す' ;;
+    "姐御肌系") printf '表情は頼もしさを保ちつつ、口元に余裕と女性らしい華やぎを少し入れる。硬い顔にしない' ;;
+    *)
+      case "$PERSONA_TONE" in
+        "丁寧") printf '表情は穏やかな笑みを保ちつつ、目元にやさしい艶を入れる。相手と同じ場で働ける満ち足りた喜びをほのかににじませる' ;;
+        "詩的") printf '表情は余韻のある柔らかな笑みにし、目元と首筋に上品な艶をにじませる。恋する幸福感が静かに残る' ;;
+        "感情的") printf '表情は明るく華やかにしつつ、女性らしい引力を保つ。嬉しさと熱量がすぐ表へ出る' ;;
+        "皮肉屋") printf '表情は余裕のある半笑いにし、挑発ではなく静かな艶で見せる。冷えた顔にはしない' ;;
+        *) printf '表情は女性らしいやわらかさと、ほのかな引力が自然に出るようにする。満ちた幸福感を微笑みに残す' ;;
+      esac
+      ;;
+  esac
+}
+
+female_pose_presence_prompt_jp() {
+  [[ "$PERSONA_ROLE" == "cc" && "$PERSONA_GENDER_RAW" == "女" ]] || return 0
+  if [[ "$PERSONA_VISUAL_AGE" == "15-19" ]]; then
+    case "$PERSONA_MASTER_REL" in
+      "騎士的") printf '守る強さは残しつつ、肩と首にやわらかな角度をつけ、体に軽いひねりを入れて軽快で華やかな立ち姿にする' ;;
+      "参謀的") printf '知性を崩さず、片肩と顎線にやわらかな角度をつけ、指先を美しく見せる。硬い直立にしない' ;;
+      "執事的") printf '端正さは残しつつ、首筋と肩線にしなやかさを入れ、上半身の軽やかなシルエットが自然に読める姿勢にする' ;;
+      *) printf '肩と首にやわらかな角度をつけ、体に軽いひねりを入れ、若い女性らしい軽やかなシルエットが自然に読めるようにする' ;;
+    esac
+    return 0
+  fi
+  case "$PERSONA_MASTER_REL" in
+    "騎士的") printf '守る強さは残しつつ、肩と首にやわらかな角度をつけ、体に軽いひねりを入れてしなやかに見せる' ;;
+    "参謀的") printf '知性を崩さず、片肩と顎線にやわらかな角度をつけ、指先を美しく見せる' ;;
+    "執事的") printf '端正さは残しつつ、首筋と肩線にしなやかさを入れ、胸元から腰への流れが自然に読める姿勢にする' ;;
+    *) printf '肩と首にやわらかな角度をつけ、体に軽いひねりを入れ、胸元や腰のラインが服越しに自然に読めるようにする' ;;
+  esac
+}
+
+female_atmosphere_prompt_jp() {
+  [[ "$PERSONA_ROLE" == "cc" && "$PERSONA_GENDER_RAW" == "女" ]] || return 0
+  if [[ "$PERSONA_VISUAL_AGE" == "15-19" ]]; then
+    case "$PERSONA_CHARA" in
+      "妖艶系"|"魔性系") printf '雰囲気は年相応の華やかさと少し背伸びした自信を持たせる。性的にせず、存在感で惹きつける' ;;
+      "天然系") printf '雰囲気は柔らかく親しみやすく、瑞々しく健康的な魅力をにじませる' ;;
+      *) printf '雰囲気は上品で華やかにし、年相応の瑞々しさと女性らしい引力を静かににじませる。性的にはしない' ;;
+    esac
+    case "$PERSONA_CHI_REL" in
+      "片想い"|"恋心"|"憧れ/ファン") printf ' 憧れや恋心を抱く相手と同じ場で働ける幸福感が、笑みと視線にほのかににじむ' ;;
+    esac
+    return 0
+  fi
+  case "$PERSONA_CHARA" in
+    "妖艶系"|"魔性系") printf '雰囲気は上品で、少し大人びた引力を強めに持たせる。露骨にせず、存在感で惹きつける' ;;
+    "天然系") printf '雰囲気は柔らかく親しみやすいまま、素朴さの奥にさりげないときめきをにじませる' ;;
+    *) printf '雰囲気は上品で、ほのかな引力と華やぎを静かににじませる。fanservice にはしない' ;;
+  esac
+  case "$PERSONA_CHI_REL" in
+    "片想い"|"恋心"|"憧れ/ファン") printf ' 憧れや恋心を抱く相手と同じ場で働ける満ち足りた幸福感が、表情と空気ににじむ' ;;
+  esac
+}
+
+female_presence_prompt_jp() {
+  [[ "$PERSONA_ROLE" == "cc" && "$PERSONA_GENDER_RAW" == "女" ]] || return 0
+  cat <<EOF
+$(female_expression_presence_prompt_jp)。$(female_pose_presence_prompt_jp)。髪、袖、襟、帯、ショールなどにやわらかな流れを入れ、静止画でも呼吸感を出す。$(female_atmosphere_prompt_jp)。
+EOF
+}
+
+persona_identity_prompt_jp() {
+  local subject_jp
+  subject_jp="$(persona_subject_jp "$PERSONA_GENDER_RAW" "$PERSONA_AGE_RAW")"
+  cat <<EOF
+人物は${subject_jp}。${PERSONA_TONE_HINT}。${PERSONA_MASTER_HINT}。${PERSONA_CHARA_HINT}。${PERSONA_ERA_HINT}。$(visual_age_prompt_jp)。性別、年代、時代が顔立ちと体つきと視線で自然に伝わるようにする。
+EOF
+}
+
+persona_silhouette_prompt_jp() {
+  case "${PERSONA_VISUAL_AGE}:${PERSONA_GENDER_RAW}" in
+    "15-19:女")
+      if [[ "$PERSONA_ROLE" == "cc" ]]; then
+        printf '15歳から19歳ほどの若い女性らしい軽やかなシルエット、やわらかな肩線、瑞々しい顔立ち、胸元の布の落ち方と腰への流れが自然に読める上半身。少年のような平坦さより、年相応に華やかな女性らしさを出す'
+      else
+        printf '15歳から19歳ほどの若い女性らしい軽やかなシルエット、やわらかな肩線、瑞々しい顔立ち、胸元の布の落ち方が自然に読める上半身'
+      fi
+      ;;
+    "20-25:女")
+      if [[ "$PERSONA_ROLE" == "cc" ]]; then
+        printf '20歳から25歳ほどの若い女性らしい自然な体つき、しなやかな肩線、知性のある輪郭、胸元と腰の差が服越しに自然に読める上半身。コミケ衣装のように絵として映える fitted なシルエット'
+      else
+        printf '20歳から25歳ほどの若い女性らしい自然な体つき、しなやかな肩線、知性のある輪郭、胸元と腰の差が服越しに自然に読める上半身'
+      fi
+      ;;
+    "25:女")
+      if [[ "$PERSONA_ROLE" == "cc" ]]; then
+        printf '25歳前後の若い女性らしい上品なシルエット、落ち着いた輪郭、胸元の立体感と腰への流れが上品に伝わる上半身。華やかな fitted costume が似合う体のライン'
+      else
+        printf '25歳前後の若い女性らしい上品なシルエット、落ち着いた輪郭、胸元の立体感が上品に伝わる上半身'
+      fi
+      ;;
+    "10代後半:男") printf '10代後半の若い男性らしい細身のシルエット、軽い肩まわり、まだ若さの残る顔立ち' ;;
+    "20代:男") printf '若い男性らしいすっきりしたシルエット、引き締まった肩線' ;;
+    "20代:女") printf '若い女性らしい自然な体つき、しなやかな肩線' ;;
+    "30代:男") printf '落ち着いた成人男性らしい端正なシルエット、安定した肩線' ;;
+    "30代:女") printf '落ち着いた成人女性らしい自然な体つき、やわらかな肩線と上品な輪郭' ;;
+    *) printf '%sとして自然に見えるシルエットと顔立ち' "$(translate_gender "$PERSONA_GENDER_RAW")" ;;
+  esac
+}
+
+persona_era_costume_prompt_jp() {
+  case "$PERSONA_ERA" in
+    "古代ギリシャ") printf '古代ギリシャ由来のドレープ、金属留め具、布の流れが美しい衣装。文字模様は入れない' ;;
+    "戦国") printf '戦国由来の和装や軽鎧、帯や紐、漆と布の対比がある衣装。家紋や旗文字は入れない' ;;
+    "大航海時代") printf '大航海時代由来のコート、ベスト、革帯、風を受けるマントや襟元のある衣装' ;;
+    "江戸")
+      if [[ "$PERSONA_ROLE" == "cc" && "$PERSONA_GENDER_RAW" == "女" ]]; then
+        if [[ "$PERSONA_VISUAL_AGE" == "15-19" ]]; then
+          printf '江戸由来の着物や羽織、帯、袖の動きがきれいに見える和装。重たすぎる厚着にせず、若い女性らしい華やかな色使いと、上半身のシルエットが自然に映える軽やかな stylized costume'
+        else
+          printf '江戸由来の着物や羽織、帯、袖の動きがきれいに見える和装。重たすぎる厚着にせず、胸元から腰へのラインが自然に映える fitted な stylized costume'
+        fi
+      else
+        printf '江戸由来の着物や羽織、帯、袖の動きがきれいに見える和装'
+      fi
+      ;;
+    "昭和レトロ")
+      case "$PERSONA_GENDER_RAW" in
+        "女") printf '昭和レトロ由来のブラウス、カーディガン、ワンピース、制服風の上着など、やわらかな布の落ち方が見える懐かしく清潔な衣装' ;;
+        "男") printf '昭和レトロ由来の開襟シャツ、ニット、ベスト、作業着や制服風の上着など、直線的で清潔な懐かしい衣装' ;;
+        *) printf '昭和レトロ由来の懐かしく清潔な衣装' ;;
+      esac
+      ;;
+    "サイバーパンク") printf 'サイバーパンク由来の機能素材、発光は最小限のジャケット、都会的なレイヤー、文字の無い装飾' ;;
+    "近未来") printf '近未来由来の滑らかな素材、ミニマルな上着、切り替えのきれいなクリーンな衣装' ;;
+    "宇宙開拓時代") printf '宇宙開拓時代由来の作業着やフライトジャケット、ハーネス、前線感のある実用衣装' ;;
+    "終末世界") printf '終末世界由来の補修跡のある布、重ね着、手袋、防塵布がある生存者の衣装' ;;
+    "魔法世界") printf '魔法世界由来のローブ、チュニック、重ねたマント、杖と似合う衣装。文字や紋章は入れない' ;;
+    *) printf '%sの空気が服の仕立てと素材に自然ににじむ' "$PERSONA_ERA" ;;
+  esac
+}
+
+persona_master_costume_prompt_jp() {
+  case "$PERSONA_MASTER_REL" in
+    "参謀的") printf '観察者であり参謀役だと分かる、整った重ね着、静かな実務感、考える人の落ち着き' ;;
+    "執事的") printf '仕える者らしい端正さ、きちんとした襟元、整った前合わせ、実務にも向く服装' ;;
+    *) printf '%sな立場が衣装と姿勢から伝わる' "$PERSONA_MASTER_REL" ;;
+  esac
+}
+
+persona_chara_costume_prompt_jp() {
+  case "$PERSONA_CHARA" in
+    "天然系") printf '少しやわらかな着こなし、きっちりしすぎない抜け感、親しみやすい柔らかさ' ;;
+    "小悪魔系") printf '細部に遊び心を入れつつ、軽やかな挑発が見える着こなし' ;;
+    "中二病系") printf '少しだけ芝居がかったレイヤーや長めの布で秘密めいた美意識を足す' ;;
+    "妖艶系") printf '上品な光沢や首元の見せ方で静かな艶を出す' ;;
+    "腹黒系") printf '表面は整って見えるが、細部は抜け目なく計算された着こなし' ;;
+    "姐御肌系") printf '肩や襟元に頼もしさがあり、主導権が見える着こなし' ;;
+    "破天荒系") printf '規律的なベースに、袖まくりや工具帯のような逸脱の気配を少しだけ混ぜる' ;;
+    "魔性系") printf '引力のある輪郭や大胆すぎない華やかさで、強い存在感を出す' ;;
+    *) printf '%sらしさが服装の細部に少しだけ出る' "$PERSONA_CHARA" ;;
+  esac
+}
+
+persona_action_prompt_jp() {
+  cat <<EOF
+$(expression_prompt_jp)。$(pose_prompt_jp)。$(motion_prompt_jp)。$(prop_prompt_jp)。$(female_presence_prompt_jp)手の所作か小道具を必ず見せ、静止した無表情の bust にしない。
+EOF
+}
+
+persona_scene_prompt_jp() {
+  case "$PERSONA_ERA" in
+    "古代ギリシャ")
+      printf '背景は白い石柱と海風が入る回廊。白壁、青い空、青銅の器具、布の影だけを静かに置く。巻物、碑文、文字模様は置かない'
+      ;;
+    "戦国")
+      printf '背景は木と漆の城郭の一角。障子、提灯の灯り、武具棚の輪郭、薄い煙を置く。旗、家紋、書状、文字は置かない'
+      ;;
+    "大航海時代")
+      printf '背景は帆柱の影が差す甲板か船室。帆布、ロープ、木材、海と空の光を置く。海図、数字入り計器、文字は置かない'
+      ;;
+    "江戸")
+      printf '背景は町家か武家屋敷の座敷。障子、木格子、行灯、無地の屏風、和紙の光を置く。掛け軸、書付、文字は置かない'
+      ;;
+    "昭和レトロ")
+      printf '背景は昭和の居間か作業部屋。木の机、丸いランプ、カーテン、ガラスの反射を置く。ポスター、雑誌、ラベル、文字は置かない'
+      ;;
+    "サイバーパンク")
+      printf '背景は雨上がりの都市か作業区画。発光配線、濡れた路面、透明な板、無文字の光面を置く。看板、UI文字、数字は置かない'
+      ;;
+    "近未来")
+      printf '背景はクリーンな近未来のラボか居住区。曲面パネル、柔らかな発光面、滑らかな壁、静かな反射を置く。UI、ラベル、文字は置かない'
+      ;;
+    "宇宙開拓時代")
+      printf '背景は宇宙港や船内の前線区画。ハッチ、手すり、作業灯、星の反射を置く。識別番号、パネル文字、警告文は置かない'
+      ;;
+    "終末世界")
+      printf '背景は補修された避難所や屋上。風化した金属、防塵布、補修材、遠景の空を置く。標識、落書き、文字は置かない'
+      ;;
+    "魔法世界")
+      printf '背景は石造りの工房か塔の一室。木の机、無地の瓶、柔らかな光、浮遊する火花だけを置く。魔法陣の文字、ルーン、書物、ラベルは置かない'
+      ;;
+    *)
+      printf '背景はその時代固有の場所だと分かる程度にとどめ、人物を主役にする。文字の出る物は置かない'
+      ;;
+  esac
+}
+
+set_persona_from_line() {
+  local persona_line="$1"
+  local role="$2"
+  local payload="${persona_line#CC  Persona: }"
+  payload="${payload#Cdx Persona: }"
+  local -a parts=()
+  local head="" tail=""
+  local chi_field="" master_field="" callname_field="" chara_field=""
+
+  reset_persona_globals
+  PERSONA_ROLE="$role"
+  IFS='/' read -r -a parts <<< "$payload"
+  [[ ${#parts[@]} -ge 6 ]] || die "unexpected persona format: ${persona_line}"
+
+  PERSONA_MBTI="$(trim "${parts[0]}")"
+  PERSONA_GENDER_RAW="$(trim "${parts[1]}")"
+  PERSONA_AGE_RAW="$(trim "${parts[2]}")"
+  PERSONA_ERA="$(trim "${parts[3]}")"
+  PERSONA_TONE="$(trim "${parts[4]}")"
+
+  head="${payload#*/}"
+  head="${head#*/}"
+  head="${head#*/}"
+  head="${head#*/}"
+  head="${head#*/}"
+  tail="$(trim "$head")"
+
+  [[ "$tail" == chi-rel:* ]] || die "unexpected persona tail format: ${persona_line}"
+  chi_field="${tail%% / master-rel:*}"
+  tail="${tail#"$chi_field"}"
+  tail="${tail# / }"
+
+  [[ "$tail" == master-rel:* ]] || die "unexpected master-rel format: ${persona_line}"
+  master_field="${tail%% / callname:*}"
+  tail="${tail#"$master_field"}"
+  tail="${tail# / }"
+
+  [[ "$tail" == callname:* ]] || die "unexpected callname format: ${persona_line}"
+  callname_field="${tail%% / chara:*}"
+  tail="${tail#"$callname_field"}"
+  tail="${tail# / }"
+
+  [[ "$tail" == chara:* ]] || die "unexpected chara format: ${persona_line}"
+  chara_field="$tail"
+
+  PERSONA_CHI_REL="${chi_field#chi-rel:}"
+  PERSONA_MASTER_REL="${master_field#master-rel:}"
+  PERSONA_CALLNAME="${callname_field#callname:}"
+  PERSONA_CHARA="${chara_field#chara:}"
+
+  PERSONA_ERA_HINT="$(describe_era_hint "$PERSONA_ERA")"
+  PERSONA_TONE_HINT="$(describe_tone_hint "$PERSONA_TONE")"
+  PERSONA_CHI_HINT="$PERSONA_CHI_REL"
+  PERSONA_MASTER_HINT="$(describe_master_hint "$PERSONA_MASTER_REL")"
+  PERSONA_CHARA_HINT="$(describe_chara_hint "$PERSONA_CHARA")"
+  PERSONA_VISUAL_AGE="$(visual_age_value "$role")"
+  PERSONA_EXPRESSION_MODE="$(expression_mode_value)"
+  PERSONA_POSE_MODE="$(pose_mode_value)"
+  PERSONA_PROP_MODE="$(prop_mode_value)"
+}
+
+role_scene_prompt_jp() {
+  persona_scene_prompt_jp
+}
+
+role_character_prompt_jp() {
+  cat <<EOF
+$(persona_identity_prompt_jp)
+$(persona_action_prompt_jp)
+EOF
+}
+
+role_costume_prompt_jp() {
+  cat <<EOF
+服装は persona データを最優先に決める。$(persona_silhouette_prompt_jp)。$(persona_era_costume_prompt_jp)。$(persona_master_costume_prompt_jp)。$(persona_chara_costume_prompt_jp)。
+かわいさや派手さよりも、役割、性格、時代感、生活感が自然に見えることを優先する。$(
+  if [[ "$PERSONA_ROLE" == "cc" && "$PERSONA_GENDER_RAW" == "女" ]]; then
+    if [[ "$PERSONA_VISUAL_AGE" == "15-19" ]]; then
+      printf ' 厚着で体型を隠しすぎない。若い女性らしい華やかなシルエットとファッション感を見せるが、性的にはしない。'
+    else
+      printf ' 厚着で体型を隠しすぎない。胸元、腰、肩線の流れが服越しに自然に読める、コミケ映えする fitted な costume design にする。'
+    fi
+  fi
+)
+EOF
+}
+
+parse_persona_output() {
+  local persona_output="$1"
+  local role="$2"
+  local line=""
+  case "$role" in
+    cc) line="$(printf '%s\n' "$persona_output" | awk '/^CC  Persona: /{print; exit}')" ;;
+    cdx) line="$(printf '%s\n' "$persona_output" | awk '/^Cdx Persona: /{print; exit}')" ;;
+    *) die "unsupported role: $role" ;;
+  esac
+  [[ -n "$line" ]] || die "could not parse persona output for role ${role}"
+  printf '%s' "$line"
+}
+
+build_flash_named_prompt() {
+  local role="$1"
+  local subject_jp
+  subject_jp="$(persona_subject_jp "$PERSONA_GENDER_RAW" "$PERSONA_AGE_RAW")"
+
+ cat <<EOF
+create an image of a vertical terminal wallpaper.
+Studio Ghibli を強く思わせる、日本の手描き劇場アニメ映画の空気。セル画の人物と背景美術の組み合わせ。やわらかな自然光、落ち着いた色、上品で非オタク的な人物造形。水彩ファンタジー絵本風や海外アニメ風にはしない。
+手順:
+1. 古典的な肖像画のような半身ポートレートにする。顔と上半身が自然に画面の主役として大きく見える、均整の取れた構図にする。頭上の余白を少なくし、胸から上、必要でも腰上までに留める。
+2. 人物像は既存の persona データを最優先にする。${subject_jp}として自然に見せる。$(role_character_prompt_jp "$role")
+3. $(role_costume_prompt_jp "$role")
+4. $(role_scene_prompt_jp "$role")
+5. 服装、姿勢、表情、視線、手元の所作で「このペインはこういう人物だ」と一目で分かるようにする。性別、年代、時代、性格、関係性が、文字に頼らず見えるようにする。
+6. 背景は人物の後ろで静かに支える。背景は personality の補助に徹し、人物が主役で、視線が自然に顔へ集まる構図にする。上端に頭が寄りすぎない。下端に肩が切れすぎない。上下の余白は釣り合いを取る。
+7. 文字が生まれそうな物体は最初から置かない。壁、棚、布、道具、器具は無地にする。
+最終ルール: 画像の中に読める文字、数字、記号、タイトル、ロゴ、透かし、署名、字幕を一切入れない。もし文字が乗りそうなら、その物体を消すか、無地で blank にする。
+EOF
+}
+
+build_flash_fallback_prompt() {
+  local role="$1"
+  local subject_jp
+  subject_jp="$(persona_subject_jp "$PERSONA_GENDER_RAW" "$PERSONA_AGE_RAW")"
+
+ cat <<EOF
+create an image of a vertical terminal wallpaper.
+Studio Ghibli を強く思わせる、日本の手描き劇場アニメ映画の空気。ただし説明的な模写ではなく、日本アニメ映画らしい顔立ちと線、セル画の人物と背景美術の組み合わせとして出す。やわらかな自然光、落ち着いた色、上品で非オタク的な人物造形。水彩ファンタジー絵本風や海外アニメ風にはしない。
+手順:
+1. 古典的な肖像画のような半身ポートレートにする。顔と上半身が自然に画面の主役として大きく見える、均整の取れた構図にする。頭上の余白を少なくし、胸から上、必要でも腰上までに留める。
+2. 人物像は既存の persona データを最優先にする。${subject_jp}として自然に見せる。$(role_character_prompt_jp "$role")
+3. $(role_costume_prompt_jp "$role")
+4. $(role_scene_prompt_jp "$role")
+5. 服装、姿勢、表情、視線、手元の所作で「このペインはこういう人物だ」と一目で分かるようにする。性別、年代、時代、性格、関係性が、文字に頼らず見えるようにする。
+6. 背景は人物の後ろで静かに支える。背景は personality の補助に徹し、人物が主役で、視線が自然に顔へ集まる構図にする。上端に頭が寄りすぎない。下端に肩が切れすぎない。上下の余白は釣り合いを取る。
+7. 文字が生まれそうな物体は最初から置かない。壁、棚、布、道具、器具は無地にする。
+最終ルール: 画像の中に読める文字、数字、記号、タイトル、ロゴ、透かし、署名、字幕を一切入れない。もし文字が乗りそうなら、その物体を消すか、無地で blank にする。
+EOF
+}
+
+build_negative_prompt() {
+  cat <<EOF
+顔全体の重心が上三分の一へ逃げる構図、頭頂と髪が上端に寄りすぎる構図、上の余白が多すぎて人物が小さく見える構図、顔より下の胴体を入れすぎて人物が間延びする構図、肩が下で切れすぎる構図、人物が小さすぎる構図、背景だけが主役の構図、全身遠景、巨大な目、萌え表現、ちびキャラ、正面ポスター構図、派手なネオン、真っ白背景、過密な装飾は禁止。水彩ファンタジー絵本風、西洋ファンタジー小説の表紙風、海外アニメ風、写実寄りファンタジーイラスト風、コンセプトアート風、油彩風、過度に painterly な筆致は禁止。読める文字、数字、記号、タイトル、字幕、ロゴ、透かし、署名、UI、吹き出し、看板、張り紙、本の題字、背表紙、紙片、ラベル、刻印、数字のある計器は禁止。人物を横倒しにする構図、portrait frame の中で人物を寝かせる構図、canvas を回転させたような sideways composition、説明図のような人工的な印や模様、顔や胴体を壊す不自然な人工物も禁止。 NO READABLE TEXT. NO WORDS. NO LETTERS. NO NUMBERS. NO SYMBOLS. NO SIDEWAYS BODY ORIENTATION. NO ROTATED PORTRAIT SUBJECT. NO FACE PLACED TOO HIGH. NO EXTRA EMPTY SPACE ABOVE THE HEAD. NO SMALL SUBJECT IN A TALL FRAME. NO EXCESS TORSO BELOW THE FACE. NO WATERCOLOR FANTASY BOOK COVER STYLE. NO WESTERN FANTASY PAINTING STYLE. NO REALISTIC DIGITAL PAINTING. NO DIAGRAM-LIKE MARKS. NO ARTIFICIAL SYMBOLS OR SHAPES BREAKING THE FACE OR TORSO.$(
+  if [[ "$PERSONA_GENDER_RAW" == "女" ]]; then
+    printf ' 女性人物が少年のように見える顔立ち、平坦すぎる子ども体型、男性的すぎる肩幅と直線シルエット、無表情で硬い直立姿勢、中性的すぎて女性と読めない上半身は禁止。 NO BOYISH FEMALE PRESENTATION. NO FLAT CHILDLIKE FEMALE BODY SHAPE. NO OVERLY MASCULINE SHOULDERS ON FEMALE SUBJECT. NO STIFF STRAIGHT POSE FOR FEMALE SUBJECT. NO ANDROGYNOUS FEMALE PRESENTATION.'
+  fi
+)
+EOF
+}
+
+prompt_version_for_model() {
+  case "$1" in
+    "$PRO_MODEL_NAME") printf '%s' "$PRO_PROMPT_VERSION" ;;
+    *) printf '%s' "$FLASH_PROMPT_VERSION" ;;
+  esac
+}
+
+prompt_schema_for_model() {
+  case "$1" in
+    "$PRO_MODEL_NAME") printf '%s' "$PRO_PROMPT_SCHEMA" ;;
+    *) printf '%s' "$FLASH_PROMPT_SCHEMA" ;;
+  esac
+}
+
+generation_tier_for_model() {
+  case "$1" in
+    "$PRO_MODEL_NAME") printf 'pro' ;;
+    *) printf 'flash' ;;
+  esac
+}
+
+style_reference_for_mode() {
+  case "$1" in
+    "$STYLE_MODE_NAMED") printf '%s' "$STYLE_REFERENCE" ;;
+    *) printf '%s' "$STYLE_REFERENCE_FALLBACK" ;;
+  esac
+}
+
+effective_gaze_jp() {
+  case "$PERSONA_TONE" in
+    "丁寧") printf '相手をまっすぐ受け止める穏やかな視線' ;;
+    "ぶっきらぼう") printf '正面を外さない鋭い視線' ;;
+    "詩的") printf '少し遠くを見るような余韻のある視線' ;;
+    "論理的") printf '焦点の定まった分析的な視線' ;;
+    "感情的") printf '熱がそのまま目に出るまっすぐな視線' ;;
+    "皮肉屋") printf '相手を値踏みするような余裕のある視線' ;;
+    *) printf '性格が分かる視線' ;;
+  esac
+}
+
+spatial_structure_prompt_jp() {
+  printf 'foreground は手元の小道具と指先、midground は人物の顔と上半身、background は時代感のある静かな環境。depth は人物主役の浅めの奥行き。'
+}
+
+lighting_prompt_jp() {
+  case "$PERSONA_ERA" in
+    "昭和レトロ") printf '柔らかな白熱灯と窓光の混ざる、少し懐かしい室内光' ;;
+    "大航海時代") printf '海からの反射光と暖かな実用灯が混ざる光' ;;
+    "江戸") printf '行灯や障子越しの柔らかな光' ;;
+    "サイバーパンク") printf '雨上がりの都市光と控えめな発光面の混ざる光' ;;
+    "近未来") printf 'クリーンで拡散した発光面が作る静かな光' ;;
+    "終末世界") printf '乾いた外光と補助灯が作る荒れた光' ;;
+    "魔法世界") printf '柔らかな魔法灯と石壁反射の混ざる光' ;;
+    *) printf 'やわらかな自然光と補助光が混ざる映画的な光' ;;
+  esac
+}
+
+gender_presentation_prompt_jp() {
+  case "$PERSONA_GENDER_RAW" in
+    "女")
+      if [[ "$PERSONA_ROLE" == "cc" && "$PERSONA_VISUAL_AGE" == "15-19" ]]; then
+        printf '女性らしいことが一目で自然に分かる顔立ち、輪郭、肩線、首筋、髪の流れにする。胸元のふくらみ、鎖骨まわり、腰への流れは服越しに自然に読めるようにする。誇張しすぎず、年相応で上品な範囲で女性の体つきを明確に出す。少年っぽい体つきや中性的すぎる見え方は避ける。色気ではなく、瑞々しさ、華やかさ、ファッション感で女性らしさを出す。中性的にも男性的にも描かない'
+      elif [[ "$PERSONA_ROLE" == "cc" ]]; then
+        printf '女性らしいことが一目で自然に分かる顔立ち、輪郭、肩線、首筋、髪の流れにする。胸元のふくらみ、鎖骨まわり、腰への流れは服越しに自然に読めるようにする。誇張しすぎず、上品な範囲で女性の体つきを明確に出す。少年っぽい体つきや中性的すぎる見え方は避ける。露出ではなく、シルエット、衣装のフィット感、姿勢、雰囲気に引力を持たせる。中性的にも男性的にも描かない'
+      elif [[ "$PERSONA_VISUAL_AGE" == "15-19" ]]; then
+        printf '女性らしいことが一目で自然に分かる顔立ち、輪郭、肩線、首筋、髪の流れにする。胸元のふくらみ、鎖骨まわり、腰への流れは服越しに自然に読めるようにする。誇張しすぎず、年相応で上品な範囲で女性の体つきを明確に出す。少年っぽい体つきや中性的すぎる見え方は避ける。色気ではなく、瑞々しさと華やかさで女性らしさを出す。中性的にも男性的にも描かない'
+      else
+        printf '女性らしいことが一目で自然に分かる顔立ち、輪郭、肩線、首筋、髪の流れにする。胸元のふくらみ、鎖骨まわり、腰への流れは服越しに自然に読めるようにする。誇張しすぎず、上品な範囲で女性の体つきを明確に出す。少年っぽい体つきや中性的すぎる見え方は避ける。露出ではなく、シルエットと雰囲気にほのかな艶と引力を持たせる。中性的にも男性的にも描かない'
+      fi
+      ;;
+    "男")
+      printf '男性らしいことが一目で自然に分かる顔立ち、骨格、肩線、首筋、手の大きさにする。中性的にも女性的にも描かない'
+      ;;
+    *)
+      printf '性別が自然に読める顔立ちと体つきにする'
+      ;;
+  esac
+}
+
+upright_portrait_prompt_jp() {
+  printf '人物を横倒しにしない。頭や肩や胴体を90度近く傾けない。portrait frame の中で人物を横向きに寝かせない。人物は自然な upright portrait として縦方向に立たせる。canvas を回転させたような sideways composition を禁止する'
+}
+
+build_pro_finished_prompt_body() {
+  local role="$1"
+  local style_mode="$2"
+  local subject_jp=""
+  local style_intro=""
+
+  subject_jp="$(persona_subject_jp "$PERSONA_GENDER_RAW" "$PERSONA_AGE_RAW")"
+  if [[ "$style_mode" == "$STYLE_MODE_NAMED" ]]; then
+    style_intro="Studio Ghibli を強く思わせる、日本の手描き劇場アニメ映画の空気。日本アニメ映画らしい顔立ちと線、セル画の人物と背景美術の組み合わせ。水彩ファンタジー絵本風や西洋ファンタジー表紙絵にはしない。上品で非オタク的な人物造形。"
+  else
+    style_intro="Studio Ghibli を強く思わせる、日本の手描き劇場アニメ映画の空気。ただし説明的な模写ではなく、日本アニメ映画らしい顔立ちと線、セル画の人物と背景美術の組み合わせとして出す。水彩ファンタジー絵本風や西洋ファンタジー表紙絵にはしない。上品で非オタク的な人物造形。"
+  fi
+
+  cat <<EOF
+縦長の terminal wallpaper。${style_intro}${PERSONA_ERA_HINT}。人物主役の半身肖像。
+
+顔と上半身が自然に画面の主役として大きく見える、均整の取れた半身肖像にする。頭頂を上へ逃がさない。頭上の余白は最小限にし、顔が上三分の一へ寄る構図にしない。腰上まで欲張らず、髪の上端から胸下から上腹部までの範囲でタイトに切り取る。顔と胸上部が画面の主役として安定して見えるようにし、人物の存在感を今より一段大きくする。背景の余白で小さく見せない。背景は人物を支える役に徹し、まず顔へ視線が行く構図にする。表情と肩と手の動きを必ず入れる。片手や指先は顔の近くか胸元に入れ、無表情な証明写真や静止 bust にしない。
+
+${subject_jp}。$(visual_age_prompt_jp)。$(gender_presentation_prompt_jp)。${PERSONA_MBTI} の気質、${PERSONA_TONE} の空気、${PERSONA_MASTER_REL} の関係性、${PERSONA_CHARA} のクセが同時に伝わるようにする。
+
+$(persona_action_prompt_jp)。
+
+衣装は、$(persona_silhouette_prompt_jp)。$(persona_era_costume_prompt_jp)。$(persona_master_costume_prompt_jp)。$(persona_chara_costume_prompt_jp)。文字、家紋、記章、番号、ロゴは入れない。
+
+背景は、$(persona_scene_prompt_jp)。背景は静かに人物を支え、人物を主役にする。
+
+重要: 文字、数字、記号、タイトル、ロゴ、透かし、署名、字幕、UI、ラベル、看板、背表紙を一切入れない。説明図のような人工的な印や模様を描かない。顔や胴体を壊す不自然な人工物を入れない。$(upright_portrait_prompt_jp)。
+EOF
+}
+
+build_pro_prompt_json() {
+  local role="$1"
+  local style_mode="$2"
+  local subject_jp=""
+  local medium="illustration"
+  local aesthetic=""
+  local style_palette=""
+  local identity_name=""
+
+  subject_jp="$(persona_subject_jp "$PERSONA_GENDER_RAW" "$PERSONA_AGE_RAW")"
+  identity_name="$(printf '%s %s portrait' "$(role_label "$role")" "$PERSONA_ERA")"
+
+  if [[ "$style_mode" == "$STYLE_MODE_NAMED" ]]; then
+    aesthetic="Studio Ghibli inspired hand-painted theatrical anime portrait"
+    style_palette="muted cinematic palette, elegant and character-first"
+  else
+    aesthetic="hand-painted theatrical anime portrait with warm background art"
+    style_palette="muted cinematic palette, elegant and illustration-first"
+  fi
+
+  jq -n \
+    --arg target_model "$PRO_MODEL_NAME" \
+    --arg identity_name "$identity_name" \
+    --arg demographics "${subject_jp} / ${PERSONA_MBTI} / ${PERSONA_GENDER_RAW} / ${PERSONA_AGE_RAW}" \
+    --arg persistent_gender "性別が自然に読める顔立ちと輪郭" \
+    --arg persistent_era "${PERSONA_ERA} の時代感" \
+    --arg persistent_chara "${PERSONA_TONE} / ${PERSONA_MASTER_REL} / ${PERSONA_CHARA}" \
+    --arg pose "$(pose_prompt_jp)" \
+    --arg expression "$(expression_prompt_jp)" \
+    --arg gaze "$(effective_gaze_jp)" \
+    --arg outfit "$(persona_era_costume_prompt_jp)。$(persona_master_costume_prompt_jp)。$(persona_chara_costume_prompt_jp)" \
+    --arg details "文字や記章のない仕立て。$(visual_age_prompt_jp)" \
+    --arg accessories "$(prop_prompt_jp)" \
+    --arg location "$(persona_scene_prompt_jp)" \
+    --arg mood "${PERSONA_TONE_HINT}。${PERSONA_MASTER_HINT}。${PERSONA_CHARA_HINT}" \
+    --arg weather_effects "$PERSONA_ERA_HINT" \
+    --arg foreground "指先、小道具、肩の動きが見える前景" \
+    --arg midground "人物の顔と上半身を主役にした半身肖像" \
+    --arg background "人物を支える静かな時代背景" \
+    --arg depth "$(spatial_structure_prompt_jp)" \
+    --arg lighting_setup "$(lighting_prompt_jp)" \
+    --arg key_position "frontal portrait lighting" \
+    --arg key_color "soft natural mixed light" \
+    --arg shadows "soft but present, natural and even across the face" \
+    --arg aesthetic "$aesthetic" \
+    --arg color_palette "$style_palette" \
+    --arg mood_style "elegant, non-otaku, character portrait with supportive background" \
+    --arg physics_engine "cloth, skin, metal, and glass should respond naturally to soft cinematic light" \
+    --arg spatial_blocking "$(spatial_structure_prompt_jp)" \
+    --arg negative_text "No readable text, no numbers, no signage, no labels, no logos, no watermarks, no subtitles, no captions." \
+    --arg negative_center "No diagram-like marks, no artificial symbols, and nothing that visually breaks the face or torso." \
+    --arg must_include_1 "Balanced portrait composition with the face and shoulders as the visual focus" \
+    --arg must_include_2 "Half-body portrait with expressive face, shoulders, and hands" \
+    --arg must_include_3 "Gender, era, and personality readable without text" \
+    '{
+      "_meta": {
+        "schema_version": "v3.0",
+        "target_model": $target_model,
+        "intent": "illustration",
+        "strict_mode": true
+      },
+      "subject": {
+        "type": "person",
+        "count": 1,
+        "identity": {
+          "name": $identity_name,
+          "demographics": $demographics,
+          "persistent_features": [
+            $persistent_gender,
+            $persistent_era,
+            $persistent_chara
+          ]
+        },
+        "current_state": {
+          "pose": $pose,
+          "expression": $expression,
+          "gaze": $gaze
+        },
+        "attire": {
+          "outfit": $outfit,
+          "colors": [$color_palette],
+          "details": $details,
+          "accessories": [$accessories]
+        }
+      },
+      "environment": {
+        "location": $location,
+        "time": "portrait-oriented terminal wallpaper, 9:16",
+        "spatial_structure": {
+          "foreground": $foreground,
+          "midground": $midground,
+          "background": $background,
+          "depth": $depth
+        },
+        "atmosphere": {
+          "mood": $mood,
+          "weather_effects": $weather_effects
+        }
+      },
+      "photography": {
+        "composition": {
+          "framing": "close_up",
+          "angle": "eye_level",
+          "rule": "balanced"
+        },
+        "visual_quality": {
+          "resolution": "1080p",
+          "texture": "soft painterly detail, expressive face, readable hands",
+          "artifacts": ["subtle film grain"]
+        }
+      },
+      "lighting": {
+        "setup": $lighting_setup,
+        "sources": [
+          {
+            "type": "key_light",
+            "position": $key_position,
+            "color": $key_color,
+            "intensity": "medium",
+            "effect": "shape the face naturally and evenly"
+          }
+        ],
+        "shadows": $shadows
+      },
+      "style": {
+        "medium": "illustration",
+        "aesthetic": $aesthetic,
+        "color_palette": $color_palette,
+        "mood": $mood_style
+      },
+      "logic_chain": {
+        "physics_engine": $physics_engine,
+        "spatial_blocking": $spatial_blocking
+      },
+      "constraints": {
+        "negative": [
+          $negative_text,
+          $negative_center
+        ],
+        "must_include": [
+          $must_include_1,
+          $must_include_2,
+          $must_include_3
+        ]
+      }
+    }'
+}
+
+build_pro_named_prompt() {
+  local role="$1"
+  cat <<EOF
+create an image of a vertical terminal wallpaper for gemini-3-pro-image-preview.
+$(build_pro_finished_prompt_body "$role" "$STYLE_MODE_NAMED")
+EOF
+}
+
+build_pro_fallback_prompt() {
+  local role="$1"
+  cat <<EOF
+create an image of a vertical terminal wallpaper for gemini-3-pro-image-preview.
+$(build_pro_finished_prompt_body "$role" "$STYLE_MODE_FALLBACK")
+EOF
+}
+
+build_prompt_for_model() {
+  local model_name="$1"
+  local role="$2"
+  local style_mode="$3"
+
+  if [[ "$model_name" == "$PRO_MODEL_NAME" ]]; then
+    if [[ "$style_mode" == "$STYLE_MODE_NAMED" ]]; then
+      build_pro_named_prompt "$role"
+    else
+      build_pro_fallback_prompt "$role"
+    fi
+    return 0
+  fi
+
+  if [[ "$style_mode" == "$STYLE_MODE_NAMED" ]]; then
+    build_flash_named_prompt "$role"
+  else
+    build_flash_fallback_prompt "$role"
+  fi
+}
+
+normalize_prompt_schema() {
+  local schema="$1"
+  local model_name="$2"
+  if [[ -n "$schema" && "$schema" != "null" ]]; then
+    printf '%s' "$schema"
+  else
+    prompt_schema_for_model "$model_name"
+  fi
+}
+
+build_prompt_hash() {
+  local prompt="$1"
+  local negative_prompt="$2"
+  local persona_line="$3"
+  local style_mode="$4"
+  local model_name="$5"
+  local prompt_version="$6"
+  local prompt_schema="$7"
+
+  hash_string "${prompt}
+${negative_prompt}
+${persona_line}
+${prompt_version}
+${model_name}
+${prompt_schema}
+${style_mode}
+${PERSONA_SOURCE_VERSION}
+${PERSONA_VISUAL_AGE}
+${PERSONA_EXPRESSION_MODE}
+${PERSONA_POSE_MODE}
+${PERSONA_PROP_MODE}"
+}
+
+extract_first_nonempty_json_string() {
+  local response_file="$1"
+  jq -r '
+    [
+      .predictions[0].bytesBase64Encoded?,
+      .predictions[0].image.bytesBase64Encoded?,
+      .generatedImages[0].image.imageBytes?,
+      .generatedImages[0].image.bytesBase64Encoded?,
+      (.candidates[0].content.parts[]? | .inlineData?.data?)
+    ]
+    | map(select(type == "string" and . != ""))
+    | .[0] // empty
+  ' "$response_file"
+}
+
+extract_first_mime_type() {
+  local response_file="$1"
+  jq -r '
+    [
+      .predictions[0].mimeType?,
+      .predictions[0].image.mimeType?,
+      .generatedImages[0].image.mimeType?,
+      (.candidates[0].content.parts[]? | .inlineData?.mimeType?)
+    ]
+    | map(select(type == "string" and . != ""))
+    | .[0] // "image/png"
+  ' "$response_file"
+}
+
+cache_is_fresh() {
+  local meta_path="$1"
+  local image_path="$2"
+  local project="$3"
+  local role="$4"
+  local persona_line="$5"
+  local meta_model=""
+  local meta_schema=""
+  local expected_prompt_version=""
+  local named_prompt=""
+  local fallback_prompt=""
+  local negative_prompt=""
+  local named_prompt_hash=""
+  local fallback_prompt_hash=""
+  [[ -s "$meta_path" && -s "$image_path" ]] || return 1
+
+  meta_model="$(jq -r '.model // empty' "$meta_path" 2>/dev/null)"
+  [[ -n "$meta_model" ]] || return 1
+  meta_schema="$(jq -r '.prompt_schema // empty' "$meta_path" 2>/dev/null)"
+  meta_schema="$(normalize_prompt_schema "$meta_schema" "$meta_model")"
+  expected_prompt_version="$(prompt_version_for_model "$meta_model")"
+  negative_prompt="$(build_negative_prompt)"
+  named_prompt="$(build_prompt_for_model "$meta_model" "$role" "$STYLE_MODE_NAMED")"
+  fallback_prompt="$(build_prompt_for_model "$meta_model" "$role" "$STYLE_MODE_FALLBACK")"
+  named_prompt_hash="$(build_prompt_hash "$named_prompt" "$negative_prompt" "$persona_line" "$STYLE_MODE_NAMED" "$meta_model" "$expected_prompt_version" "$meta_schema")"
+  fallback_prompt_hash="$(build_prompt_hash "$fallback_prompt" "$negative_prompt" "$persona_line" "$STYLE_MODE_FALLBACK" "$meta_model" "$expected_prompt_version" "$meta_schema")"
+
+  jq -e \
+    --arg prompt_version "$expected_prompt_version" \
+    --arg model "$meta_model" \
+    --arg prompt_schema "$meta_schema" \
+    --arg aspect_ratio "$ASPECT_RATIO" \
+    --arg project "$project" \
+    --arg role "$role" \
+    --arg named_prompt_hash "$named_prompt_hash" \
+    --arg fallback_prompt_hash "$fallback_prompt_hash" \
+    '
+      .prompt_version == $prompt_version and
+      .model == $model and
+      ((.prompt_schema // $prompt_schema) == $prompt_schema) and
+      .aspect_ratio == $aspect_ratio and
+      .project == $project and
+      .role == $role and
+      (
+        .prompt_hash == $named_prompt_hash or
+        .prompt_hash == $fallback_prompt_hash
+      )
+    ' "$meta_path" >/dev/null 2>&1
+}
+
+request_imagen() {
+  local prompt="$1"
+  local negative_prompt="$2"
+  local response_file="$3"
+  local api_key_value="$4"
+  local model_name="$5"
+  local vertex_project="$6"
+  local vertex_location="$7"
+  local error_file="${8:-${response_file}.error.json}"
+  python3 - "$prompt" "$negative_prompt" "$response_file" "$api_key_value" "$ASPECT_RATIO" "$model_name" "$vertex_project" "$vertex_location" "$error_file" "$REQUEST_TIMEOUT_SECONDS" <<'PY'
+import base64
+import json
+import signal
+import sys
+
+from google import genai
+
+prompt, negative_prompt, response_path, api_key, aspect_ratio, model_name, vertex_project, vertex_location, error_path, request_timeout = sys.argv[1:11]
+request_timeout = int(request_timeout)
+
+full_prompt = (
+    prompt
+    + "\n\n絶対条件:\n"
+    + negative_prompt
+    + "\n文字は一切入れない。読める文字、記号、ラベル、看板、背表紙、メモ、UI、数字、刻印を出さない。"
+    + "\nNO READABLE TEXT ANYWHERE. NO TITLE. NO CAPTION. NO SUBTITLE. NO LETTERS. NO NUMBERS. NO SYMBOLS."
+    + "\n古典的な肖像画の構図。顔と上半身が自然に大きく見える、均整の取れた半身ポートレートにする。頭上の余白を少なくし、人物を一番大きく見せる。"
+    + "\n表情と肩と手の動きを必ず入れる。無表情な証明写真や静止 bust にしない。"
+)
+
+last_error = None
+response = None
+
+def write_error(kind, message, *, code=None, status=None, exception_type=None):
+    payload = {
+        "kind": kind,
+        "message": message,
+        "code": code,
+        "status": status,
+        "exception_type": exception_type,
+    }
+    with open(error_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+
+
+class RequestTimedOut(Exception):
+    pass
+
+
+def _alarm_handler(signum, frame):
+    raise RequestTimedOut(f"image generation request exceeded {request_timeout}s timeout")
+
+
+def generate_with_timeout(client, *, model, contents, config):
+    previous = signal.signal(signal.SIGALRM, _alarm_handler)
+    signal.alarm(request_timeout)
+    try:
+        return client.models.generate_content(
+            model=model,
+            contents=contents,
+            config=config,
+        )
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+if vertex_project:
+    try:
+        client = genai.Client(
+            vertexai=True,
+            project=vertex_project,
+            location=vertex_location or "global",
+        )
+        response = generate_with_timeout(
+            client,
+            model=model_name,
+            contents=full_prompt,
+            config={
+                "response_modalities": ["image"],
+            },
+        )
+    except Exception as exc:
+        last_error = exc
+
+if response is None and (not vertex_project) and api_key:
+    try:
+        client = genai.Client(api_key=api_key)
+        response = generate_with_timeout(
+            client,
+            model=model_name,
+            contents=full_prompt,
+            config={
+                "response_modalities": ["image"],
+            },
+        )
+    except Exception as exc:
+        last_error = exc
+
+if response is None:
+    if last_error is not None:
+        status_code = getattr(last_error, "status_code", None)
+        response_json = getattr(last_error, "response_json", None)
+        error_status = None
+        if isinstance(response_json, dict):
+            error_status = ((response_json.get("error") or {}).get("status"))
+        error_kind = "request_timeout" if isinstance(last_error, RequestTimedOut) else "api_error"
+        write_error(
+            error_kind,
+            str(last_error),
+            code=status_code,
+            status=error_status,
+            exception_type=type(last_error).__name__,
+        )
+        raise last_error
+    message = "No usable Vertex AI ADC or API key auth path for image generation"
+    write_error("auth_unavailable", message, exception_type="SystemExit")
+    raise SystemExit(message)
+
+preview = {"predictions": []}
+for candidate in getattr(response, "candidates", []) or []:
+    content = getattr(candidate, "content", None)
+    for part in getattr(content, "parts", []) or []:
+        inline = getattr(part, "inline_data", None)
+        if not inline:
+            continue
+        data = getattr(inline, "data", None)
+        if not data:
+            continue
+        mime_type = getattr(inline, "mime_type", None) or getattr(inline, "mimeType", None) or "image/png"
+        if isinstance(data, str):
+            try:
+                binary = base64.b64decode(data)
+            except Exception:
+                binary = data.encode("utf-8")
+        else:
+            binary = bytes(data)
+        preview["predictions"].append(
+            {
+                "bytesBase64Encoded": base64.b64encode(binary).decode("ascii"),
+                "mimeType": mime_type,
+            }
+        )
+
+if not preview["predictions"]:
+    message = "No image data in Nano Banana response"
+    write_error("no_image_data", message, exception_type="SystemExit")
+    raise SystemExit(message)
+
+with open(response_path, "w", encoding="utf-8") as f:
+    json.dump(preview, f)
+
+with open(error_path, "w", encoding="utf-8") as f:
+    json.dump({"kind": "none", "message": ""}, f)
+PY
+}
+
+load_generation_error_json() {
+  local error_file="$1"
+  if [[ -s "$error_file" ]]; then
+    LAST_GENERATION_ERROR_JSON="$(cat "$error_file")"
+  else
+    LAST_GENERATION_ERROR_JSON='null'
+  fi
+}
+
+generation_error_is_quota_429() {
+  jq -e '
+    (.code == 429) or
+    (.status == "RESOURCE_EXHAUSTED") or
+    (.message | type == "string" and test("RESOURCE_EXHAUSTED|Resource has been exhausted"))
+  ' >/dev/null 2>&1 <<<"${LAST_GENERATION_ERROR_JSON:-null}"
+}
+
+generation_error_is_flash_recoverable() {
+  jq -e '
+    (.kind == "request_timeout") or
+    (.kind == "no_image_data") or
+    (.code == 429) or
+    (.status == "RESOURCE_EXHAUSTED") or
+    (.message | type == "string" and test("RESOURCE_EXHAUSTED|Resource has been exhausted"))
+  ' >/dev/null 2>&1 <<<"${LAST_GENERATION_ERROR_JSON:-null}"
+}
+
+prepare_generation_prompts() {
+  local model_name="$1"
+  local role="$2"
+  generation_prompt_schema="$(prompt_schema_for_model "$model_name")"
+  generation_prompt_version="$(prompt_version_for_model "$model_name")"
+  named_prompt="$(build_prompt_for_model "$model_name" "$role" "$STYLE_MODE_NAMED")"
+  fallback_prompt="$(build_prompt_for_model "$model_name" "$role" "$STYLE_MODE_FALLBACK")"
+}
+
+set_face_crop_fallback_json() {
+  local reason="$1"
+  local detector="${2:-macos-vision}"
+  LAST_FACE_CROP_JSON="$(jq -cn \
+    --arg policy "$FACE_CROP_POLICY" \
+    --arg detector "$detector" \
+    --arg reason "$reason" \
+    '{policy:$policy, detector:$detector, fallback_used:true, reason:$reason}')"
+}
+
+write_center_cropped_image() {
+  local decoded_path="$1"
+  local image_path="$2"
+
+  if command -v magick >/dev/null 2>&1; then
+    magick "$decoded_path" \
+      -resize "${TARGET_WIDTH}x${TARGET_HEIGHT}^" \
+      -gravity center \
+      -extent "${TARGET_WIDTH}x${TARGET_HEIGHT}" \
+      -strip \
+      "$image_path"
+  else
+    mv "$decoded_path" "$image_path"
+  fi
+}
+
+apply_face_crop_from_json() {
+  local source_image="$1"
+  local target_image="$2"
+  local face_crop_json="$3"
+  local crop_x=""
+  local crop_y=""
+  local crop_width=""
+  local crop_height=""
+
+  crop_x="$(jq -r '.crop_rect_px.x' <<<"$face_crop_json")"
+  crop_y="$(jq -r '.crop_rect_px.y' <<<"$face_crop_json")"
+  crop_width="$(jq -r '.crop_rect_px.width' <<<"$face_crop_json")"
+  crop_height="$(jq -r '.crop_rect_px.height' <<<"$face_crop_json")"
+
+  magick "$source_image" \
+    -crop "${crop_width}x${crop_height}+${crop_x}+${crop_y}" \
+    +repage \
+    -resize "${TARGET_WIDTH}x${TARGET_HEIGHT}^" \
+    -gravity center \
+    -extent "${TARGET_WIDTH}x${TARGET_HEIGHT}" \
+    -strip \
+    "$target_image"
+}
+
+face_crop_needs_refine() {
+  local face_crop_json="$1"
+  jq -e --argjson tolerance "$FACE_CROP_CENTER_TOLERANCE" '
+    (((.face_center_norm.x // 0.5) - 0.5) | if . < 0 then -. else . end) > $tolerance or
+    (((.face_center_norm.y // 0.5) - 0.5) | if . < 0 then -. else . end) > $tolerance
+  ' <<<"$face_crop_json" >/dev/null 2>&1
+}
+
+face_crop_is_sideways() {
+  local face_crop_json="$1"
+  jq -e --argjson threshold "$FACE_CROP_MAX_ABS_ROLL_RADIANS" '
+    (.sideways_detected // false) == true or
+    (((.face_roll_radians // 0) | if . < 0 then -. else . end) >= $threshold)
+  ' <<<"$face_crop_json" >/dev/null 2>&1
+}
+
+vision_face_crop_json() {
+  local image_path="$1"
+  swift - "$image_path" "$TARGET_WIDTH" "$TARGET_HEIGHT" "$FACE_CROP_TARGET_FACE_HEIGHT_RATIO" "$FACE_CROP_MAX_ZOOM" "$FACE_CROP_POLICY" <<'SWIFT'
+import Foundation
+import Vision
+import CoreGraphics
+import ImageIO
+
+let args = CommandLine.arguments
+guard args.count >= 7 else {
+    fputs("missing arguments\n", stderr)
+    exit(2)
+}
+
+let imagePath = args[1]
+let targetWidth = Double(args[2]) ?? 1024
+let targetHeight = Double(args[3]) ?? 1536
+let targetFaceRatio = Double(args[4]) ?? 0.24
+let preferredMaxZoom = Double(args[5]) ?? 1.75
+let policy = args[6]
+
+func regionPoints(_ region: VNFaceLandmarkRegion2D?, in faceBox: CGRect, sourceWidth: Double, sourceHeight: Double) -> [(Double, Double)] {
+    guard let region else { return [] }
+    return (0..<region.pointCount).map { index in
+        let point = region.normalizedPoints[index]
+        let x = (faceBox.origin.x + CGFloat(point.x) * faceBox.width) * CGFloat(sourceWidth)
+        let yTop = (1.0 - (faceBox.origin.y + CGFloat(point.y) * faceBox.height)) * CGFloat(sourceHeight)
+        return (Double(x), Double(yTop))
+    }
+}
+
+let url = URL(fileURLWithPath: imagePath) as CFURL
+guard let source = CGImageSourceCreateWithURL(url, nil),
+      let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+    fputs("could not load image\n", stderr)
+    exit(3)
+}
+
+let request = VNDetectFaceLandmarksRequest()
+let handler = VNImageRequestHandler(cgImage: image, options: [:])
+do {
+    try handler.perform([request])
+} catch {
+    fputs("vision failed: \(error)\n", stderr)
+    exit(4)
+}
+
+let observations = (request.results ?? []).compactMap { $0 as? VNFaceObservation }
+guard let face = observations.max(by: { ($0.boundingBox.width * $0.boundingBox.height) < ($1.boundingBox.width * $1.boundingBox.height) }) else {
+    let payload: [String: Any] = [
+        "policy": policy,
+        "detector": "macos-vision",
+        "fallback_used": true,
+        "reason": "no_face_detected"
+    ]
+    let data = try JSONSerialization.data(withJSONObject: payload, options: [])
+    FileHandle.standardOutput.write(data)
+    exit(0)
+}
+
+let sourceWidth = Double(image.width)
+let sourceHeight = Double(image.height)
+let targetAspect = targetWidth / targetHeight
+let bbox = face.boundingBox
+
+let faceWidth = bbox.width * sourceWidth
+let faceHeight = bbox.height * sourceHeight
+let faceBBoxTopYNorm = 1.0 - (bbox.origin.y + bbox.height)
+let faceRollRadians = face.roll?.doubleValue
+let faceYawRadians = face.yaw?.doubleValue
+let facePitchRadians = face.pitch?.doubleValue
+let sidewaysDetected = (faceRollRadians.map { abs($0) >= 0.7853981633974483 } ?? false)
+
+let landmarkPoints = (
+    regionPoints(face.landmarks?.faceContour, in: bbox, sourceWidth: sourceWidth, sourceHeight: sourceHeight) +
+    regionPoints(face.landmarks?.leftEye, in: bbox, sourceWidth: sourceWidth, sourceHeight: sourceHeight) +
+    regionPoints(face.landmarks?.rightEye, in: bbox, sourceWidth: sourceWidth, sourceHeight: sourceHeight) +
+    regionPoints(face.landmarks?.nose, in: bbox, sourceWidth: sourceWidth, sourceHeight: sourceHeight) +
+    regionPoints(face.landmarks?.outerLips, in: bbox, sourceWidth: sourceWidth, sourceHeight: sourceHeight) +
+    regionPoints(face.landmarks?.innerLips, in: bbox, sourceWidth: sourceWidth, sourceHeight: sourceHeight)
+)
+
+let faceCenterX: Double
+let faceCenterYTop: Double
+let faceCenterSource: String
+
+if !landmarkPoints.isEmpty {
+    let minX = landmarkPoints.map(\.0).min() ?? ((bbox.origin.x + bbox.width / 2.0) * sourceWidth)
+    let maxX = landmarkPoints.map(\.0).max() ?? minX
+    let minY = landmarkPoints.map(\.1).min() ?? ((1.0 - (bbox.origin.y + bbox.height / 2.0)) * sourceHeight)
+    let maxY = landmarkPoints.map(\.1).max() ?? minY
+    faceCenterX = (minX + maxX) / 2.0
+    faceCenterYTop = (minY + maxY) / 2.0
+    faceCenterSource = "landmarks"
+} else {
+    faceCenterX = (bbox.origin.x + bbox.width / 2.0) * sourceWidth
+    faceCenterYTop = (1.0 - (bbox.origin.y + bbox.height / 2.0)) * sourceHeight
+    faceCenterSource = "bbox"
+}
+
+let baseCropWidth: Double
+let baseCropHeight: Double
+if sourceWidth / sourceHeight > targetAspect {
+    baseCropHeight = sourceHeight
+    baseCropWidth = sourceHeight * targetAspect
+} else {
+    baseCropWidth = sourceWidth
+    baseCropHeight = sourceWidth / targetAspect
+}
+
+let allowedHeightFromY = max(1.0, 2.0 * min(faceCenterYTop, sourceHeight - faceCenterYTop))
+let allowedHeightFromX = max(1.0, 2.0 * min(faceCenterX, sourceWidth - faceCenterX) / targetAspect)
+let centeredHeightLimit = max(1.0, min(baseCropHeight, allowedHeightFromY, allowedHeightFromX))
+let minPreferredCropHeight = max(1.0, baseCropHeight / preferredMaxZoom)
+let idealCropHeight = max(1.0, faceHeight / targetFaceRatio)
+
+var cropHeight = min(max(idealCropHeight, minPreferredCropHeight), baseCropHeight)
+if cropHeight > centeredHeightLimit {
+    cropHeight = centeredHeightLimit
+}
+cropHeight = max(1.0, cropHeight)
+
+var cropWidth = cropHeight * targetAspect
+var cropX = faceCenterX - cropWidth / 2.0
+var cropY = faceCenterYTop - cropHeight / 2.0
+
+cropX = min(max(0.0, cropX), max(0.0, sourceWidth - cropWidth))
+cropY = min(max(0.0, cropY), max(0.0, sourceHeight - cropHeight))
+
+var cropWidthInt = max(1, Int(cropWidth.rounded()))
+var cropHeightInt = max(1, Int(cropHeight.rounded()))
+cropWidthInt = min(cropWidthInt, Int(sourceWidth))
+cropHeightInt = min(cropHeightInt, Int(sourceHeight))
+
+if Double(cropWidthInt) / Double(cropHeightInt) > targetAspect {
+    cropWidthInt = max(1, Int((Double(cropHeightInt) * targetAspect).rounded()))
+} else {
+    cropHeightInt = max(1, Int((Double(cropWidthInt) / targetAspect).rounded()))
+}
+
+let cropXInt = max(0, min(Int((faceCenterX - Double(cropWidthInt) / 2.0).rounded()), Int(sourceWidth) - cropWidthInt))
+let cropYInt = max(0, min(Int((faceCenterYTop - Double(cropHeightInt) / 2.0).rounded()), Int(sourceHeight) - cropHeightInt))
+
+let finalFaceCenterNormX = (faceCenterX - Double(cropXInt)) / Double(cropWidthInt)
+let finalFaceCenterNormY = (faceCenterYTop - Double(cropYInt)) / Double(cropHeightInt)
+let zoomFactor = baseCropHeight / Double(cropHeightInt)
+
+let payload: [String: Any] = [
+    "policy": policy,
+    "detector": "macos-vision",
+    "fallback_used": false,
+    "face_center_source": faceCenterSource,
+    "coordinate_space": "top-left-normalized",
+    "source_size_px": [
+        "width": Int(sourceWidth),
+        "height": Int(sourceHeight),
+    ],
+    "face_bbox_norm": [
+        "x": bbox.origin.x,
+        "y": faceBBoxTopYNorm,
+        "width": bbox.width,
+        "height": bbox.height,
+    ],
+    "face_center_norm": [
+        "x": faceCenterX / sourceWidth,
+        "y": faceCenterYTop / sourceHeight,
+    ],
+    "crop_rect_px": [
+        "x": cropXInt,
+        "y": cropYInt,
+        "width": cropWidthInt,
+        "height": cropHeightInt,
+    ],
+    "output_face_center_norm": [
+        "x": finalFaceCenterNormX,
+        "y": finalFaceCenterNormY,
+    ],
+    "target_face_height_ratio": targetFaceRatio,
+    "detected_face_height_ratio": faceHeight / sourceHeight,
+    "output_face_height_ratio": faceHeight / Double(cropHeightInt),
+    "zoom_factor": zoomFactor,
+    "preferred_max_zoom": preferredMaxZoom,
+    "preferred_zoom_exceeded": zoomFactor > preferredMaxZoom + 0.001,
+    "face_roll_radians": faceRollRadians as Any,
+    "face_yaw_radians": faceYawRadians as Any,
+    "face_pitch_radians": facePitchRadians as Any,
+    "sideways_detected": sidewaysDetected,
+]
+
+let data = try JSONSerialization.data(withJSONObject: payload, options: [])
+FileHandle.standardOutput.write(data)
+SWIFT
+}
+
+write_image_from_response() {
+  local response_file="$1"
+  local image_path="$2"
+  local tmp_dir="$3"
+  local encoded=""
+  local mime_type=""
+  local raw_path="${tmp_dir}/raw-image.bin"
+  local decoded_path="${tmp_dir}/decoded-image.png"
+  local current_face_crop_json=""
+  local refined_output_path="${tmp_dir}/refined-image.png"
+  local applied_passes=0
+  local needs_refine=0
+
+  LAST_FACE_CROP_JSON='null'
+  encoded="$(extract_first_nonempty_json_string "$response_file")"
+  [[ -n "$encoded" ]] || return 1
+  mime_type="$(extract_first_mime_type "$response_file")"
+
+  decode_base64_to_file "$encoded" "$raw_path"
+
+  case "$mime_type" in
+    image/png)
+      mv "$raw_path" "$decoded_path"
+      ;;
+    *)
+      if command -v magick >/dev/null 2>&1; then
+        magick "$raw_path" PNG32:"$decoded_path"
+      else
+        mv "$raw_path" "$decoded_path"
+      fi
+      ;;
+  esac
+
+  if ! command -v magick >/dev/null 2>&1; then
+    set_face_crop_fallback_json "magick_unavailable" "none"
+    mv "$decoded_path" "$image_path"
+    return 0
+  fi
+
+  write_center_cropped_image "$decoded_path" "$image_path"
+
+  if ! command -v swift >/dev/null 2>&1; then
+    set_face_crop_fallback_json "swift_unavailable" "none"
+    return 0
+  fi
+
+  if ! current_face_crop_json="$(vision_face_crop_json "$image_path" 2>/dev/null)" || [[ -z "$current_face_crop_json" ]]; then
+    set_face_crop_fallback_json "vision_detection_failed"
+    return 1
+  fi
+
+  if [[ "$(jq -r 'if has("fallback_used") then .fallback_used else true end' <<<"$current_face_crop_json")" == "true" ]]; then
+    LAST_FACE_CROP_JSON="$(jq -cn --argjson final "$current_face_crop_json" --argjson pass_count "$applied_passes" '
+      $final + { pass_count: $pass_count }')"
+    return 1
+  fi
+
+  if face_crop_is_sideways "$current_face_crop_json"; then
+    LAST_FACE_CROP_JSON="$(jq -cn --argjson final "$current_face_crop_json" --argjson pass_count "$applied_passes" '
+      $final + { fallback_used: true, reason: "sideways_face_roll", pass_count: $pass_count }')"
+    return 1
+  fi
+
+  apply_face_crop_from_json "$image_path" "$refined_output_path" "$current_face_crop_json"
+  mv "$refined_output_path" "$image_path"
+  applied_passes=1
+
+  if ! current_face_crop_json="$(vision_face_crop_json "$image_path" 2>/dev/null)" || [[ -z "$current_face_crop_json" ]]; then
+    set_face_crop_fallback_json "vision_detection_failed_after_refine"
+    return 0
+  fi
+
+  if [[ "$(jq -r 'if has("fallback_used") then .fallback_used else true end' <<<"$current_face_crop_json")" == "true" ]]; then
+    LAST_FACE_CROP_JSON="$(jq -cn --argjson final "$current_face_crop_json" --argjson pass_count "$applied_passes" '
+      $final + { pass_count: $pass_count }')"
+    return 0
+  fi
+
+  if face_crop_is_sideways "$current_face_crop_json"; then
+    LAST_FACE_CROP_JSON="$(jq -cn --argjson final "$current_face_crop_json" --argjson pass_count "$applied_passes" '
+      $final + { fallback_used: true, reason: "sideways_face_roll_after_refine", pass_count: $pass_count }')"
+    return 1
+  fi
+
+  needs_refine=0
+  if face_crop_needs_refine "$current_face_crop_json"; then
+    needs_refine=1
+  fi
+
+  if (( needs_refine != 0 )); then
+    apply_face_crop_from_json "$image_path" "$refined_output_path" "$current_face_crop_json"
+    mv "$refined_output_path" "$image_path"
+    applied_passes=2
+  fi
+
+  if current_face_crop_json="$(vision_face_crop_json "$image_path" 2>/dev/null)" && [[ -n "$current_face_crop_json" ]]; then
+    if [[ "$(jq -r 'if has("fallback_used") then .fallback_used else true end' <<<"$current_face_crop_json")" != "true" ]] && face_crop_is_sideways "$current_face_crop_json"; then
+      LAST_FACE_CROP_JSON="$(jq -cn --argjson final "$current_face_crop_json" --argjson pass_count "$applied_passes" '
+        $final + { fallback_used: true, reason: "sideways_face_roll_after_final_refine", pass_count: $pass_count }')"
+      return 1
+    fi
+    LAST_FACE_CROP_JSON="$(jq -cn --argjson final "$current_face_crop_json" --argjson pass_count "$applied_passes" '
+      $final + { pass_count: $pass_count }')"
+  else
+    set_face_crop_fallback_json "vision_detection_failed_after_refine"
+  fi
+}
+
+generate_style_image() {
+  local prompt="$1"
+  local negative_prompt="$2"
+  local response_file="$3"
+  local api_key_value="$4"
+  local image_path="$5"
+  local tmp_dir="$6"
+  local model_name="$7"
+  local vertex_project="$8"
+  local vertex_location="$9"
+  local error_file="${tmp_dir}/request-error.json"
+  local attempt=1
+
+  LAST_GENERATION_ERROR_JSON='null'
+  while (( attempt <= MAX_GENERATION_ATTEMPTS )); do
+    : > "$response_file"
+    rm -f "$error_file"
+    if ! request_imagen "$prompt" "$negative_prompt" "$response_file" "$api_key_value" "$model_name" "$vertex_project" "$vertex_location" "$error_file"; then
+      load_generation_error_json "$error_file"
+      attempt=$((attempt + 1))
+      continue
+    fi
+    if ! write_image_from_response "$response_file" "$image_path" "$tmp_dir"; then
+      LAST_GENERATION_ERROR_JSON="$(jq -cn '{kind:"postprocess_failed", message:"write_image_from_response failed"}')"
+      attempt=$((attempt + 1))
+      continue
+    fi
+    LAST_GENERATION_ERROR_JSON='null'
+    return 0
+  done
+
+  return 1
+}
+
+write_sidecar() {
+  local meta_path="$1"
+  local project="$2"
+  local role="$3"
+  local style_mode="$4"
+  local prompt="$5"
+  local negative_prompt="$6"
+  local persona_line="$7"
+  local image_path="$8"
+  local response_file="$9"
+  local gender_desc="${10}"
+  local age_desc="${11}"
+  local model_name="${12}"
+  local prompt_version="${13}"
+  local prompt_schema="${14}"
+  local selection_reason="${15}"
+  local prompt_hash=""
+  local meta_tmp="${meta_path}.tmp"
+  local style_preference=""
+
+  prompt_hash="$(build_prompt_hash "$prompt" "$negative_prompt" "$persona_line" "$style_mode" "$model_name" "$prompt_version" "$prompt_schema")"
+  style_preference="$(style_reference_for_mode "$style_mode")"
+
+  jq -n \
+    --arg project "$project" \
+    --arg role "$role" \
+    --arg model "$model_name" \
+    --arg prompt_version "$prompt_version" \
+    --arg prompt_schema "$prompt_schema" \
+    --arg persona_source_version "$PERSONA_SOURCE_VERSION" \
+    --arg generation_tier "$(generation_tier_for_model "$model_name")" \
+    --arg selection_reason "$selection_reason" \
+    --arg style_mode "$style_mode" \
+    --arg style_preference "$style_preference" \
+    --arg aspect_ratio "$ASPECT_RATIO" \
+    --arg generated_at "$(now_utc)" \
+    --arg image_path "$image_path" \
+    --arg persona_line "$persona_line" \
+    --arg mbti "$PERSONA_MBTI" \
+    --arg gender_raw "$PERSONA_GENDER_RAW" \
+    --arg gender "$gender_desc" \
+    --arg age_raw "$PERSONA_AGE_RAW" \
+    --arg age "$age_desc" \
+    --arg era "$PERSONA_ERA" \
+    --arg era_hint "$PERSONA_ERA_HINT" \
+    --arg tone "$PERSONA_TONE" \
+    --arg tone_hint "$PERSONA_TONE_HINT" \
+    --arg chi_rel "$PERSONA_CHI_REL" \
+    --arg chi_hint "$PERSONA_CHI_HINT" \
+    --arg master_rel "$PERSONA_MASTER_REL" \
+    --arg master_hint "$PERSONA_MASTER_HINT" \
+    --arg callname "$PERSONA_CALLNAME" \
+    --arg chara "$PERSONA_CHARA" \
+    --arg chara_hint "$PERSONA_CHARA_HINT" \
+    --arg effective_gender "$PERSONA_GENDER_RAW" \
+    --arg effective_visual_age "$PERSONA_VISUAL_AGE" \
+    --arg effective_era "$PERSONA_ERA" \
+    --arg expression_mode "$PERSONA_EXPRESSION_MODE" \
+    --arg pose_mode "$PERSONA_POSE_MODE" \
+    --arg prop_mode "$PERSONA_PROP_MODE" \
+    --arg prompt "$prompt" \
+    --arg negative_prompt "$negative_prompt" \
+    --arg prompt_hash "$prompt_hash" \
+    --arg endpoint "google-genai://models/${model_name}" \
+    --argjson face_crop "$LAST_FACE_CROP_JSON" \
+    --slurpfile response_json "$response_file" \
+    '{
+      version: 1,
+      project: $project,
+      role: $role,
+      model: $model,
+      prompt_version: $prompt_version,
+      prompt_schema: $prompt_schema,
+      persona_source_version: $persona_source_version,
+      generation_tier: $generation_tier,
+      selection_reason: $selection_reason,
+      style_mode: $style_mode,
+      style_preference: $style_preference,
+      aspect_ratio: $aspect_ratio,
+      generated_at: $generated_at,
+      image_path: $image_path,
+      persona_line: $persona_line,
+      persona: {
+        mbti: $mbti,
+        gender_raw: $gender_raw,
+        gender: $gender,
+        age_raw: $age_raw,
+        age: $age,
+        era: $era,
+        era_hint: $era_hint,
+        tone: $tone,
+        tone_hint: $tone_hint,
+        chi_rel: $chi_rel,
+        chi_hint: $chi_hint,
+        master_rel: $master_rel,
+        master_hint: $master_hint,
+        callname: $callname,
+        chara: $chara,
+        chara_hint: $chara_hint
+      },
+      render_persona: {
+        effective_gender: $effective_gender,
+        effective_visual_age: $effective_visual_age,
+        effective_era: $effective_era,
+        expression_mode: $expression_mode,
+        pose_mode: $pose_mode,
+        prop_mode: $prop_mode
+      },
+      prompt: $prompt,
+      negative_prompt: $negative_prompt,
+      prompt_hash: $prompt_hash,
+      api: {
+        endpoint: $endpoint,
+        response_modalities: ["image"],
+        aspect_ratio: $aspect_ratio
+      },
+      postprocess: {
+        face_crop: $face_crop
+      },
+      response_preview: (
+        if ($response_json | length) > 0 then
+          ($response_json[0] | del(.predictions[0].bytesBase64Encoded, .predictions[0].image.bytesBase64Encoded, .generatedImages[0].image.imageBytes, .generatedImages[0].image.bytesBase64Encoded, .candidates[0].content.parts))
+        else
+          {}
+        end
+      )
+    }' > "$meta_tmp"
+  mv "$meta_tmp" "$meta_path"
+}
+
+generate_background() {
+  local project_input="$1"
+  local role="$2"
+  local refresh_flag="$3"
+  local project=""
+  local cache_dir=""
+  local image_path=""
+  local meta_path=""
+  local persona_output=""
+  local persona_line=""
+  local gender_desc=""
+  local age_desc=""
+  local named_prompt=""
+  local fallback_prompt=""
+  local negative_prompt=""
+  local api_key_value=""
+  local vertex_project=""
+  local vertex_location=""
+  local tmp_dir=""
+  local response_file=""
+  local style_mode=""
+  local generation_model=""
+  local generation_prompt_version=""
+  local generation_prompt_schema=""
+  local selection_reason=""
+  local has_image="false"
+  local has_meta="false"
+  local generation_lock=""
+  local lock_mtime=""
+  local now_epoch=""
+
+  project="$(detect_project_root "$project_input")" || die "project path not found: $project_input"
+  cache_dir="$(project_cache_dir "$project")"
+  image_path="$(project_image_path "$project" "$role")"
+  meta_path="$(project_meta_path "$project" "$role")"
+  mkdir -p "$cache_dir"
+
+  require_cmd "$CC_PERSONA_BIN"
+  require_cmd jq
+  require_cmd python3
+  require_cmd base64
+  require_cmd shasum
+  python3 -c 'from google import genai' >/dev/null 2>&1 || die "python package google-genai is required"
+
+  [[ -s "$image_path" ]] && has_image="true"
+  [[ -s "$meta_path" ]] && has_meta="true"
+  if [[ "$refresh_flag" != "true" ]] && [[ "$has_image" == "true" && "$has_meta" == "true" ]]; then
+    printf '%s\n' "$image_path"
+    return 0
+  fi
+
+  mkdir -p "$WORK_ROOT"
+  generation_lock="$(generation_lock_dir "$project")"
+  if [[ -d "$generation_lock" ]]; then
+    lock_mtime="$(stat -f '%m' "$generation_lock" 2>/dev/null || printf '0')"
+    now_epoch="$(date +%s)"
+    if [[ "$lock_mtime" =~ ^[0-9]+$ ]] && (( now_epoch - lock_mtime > 300 )); then
+      rm -rf "$generation_lock"
+    fi
+  fi
+  while ! mkdir "$generation_lock" 2>/dev/null; do
+    sleep 1
+    lock_mtime="$(stat -f '%m' "$generation_lock" 2>/dev/null || printf '0')"
+    now_epoch="$(date +%s)"
+    if [[ "$lock_mtime" =~ ^[0-9]+$ ]] && (( now_epoch - lock_mtime > 300 )); then
+      rm -rf "$generation_lock"
+    fi
+  done
+
+  persona_output="$(cd "$project" && "$CC_PERSONA_BIN")"
+  if ! persona_line="$(parse_persona_output "$persona_output" "$role")"; then
+    rm -rf "$generation_lock"
+    return 1
+  fi
+  set_persona_from_line "$persona_line" "$role"
+  gender_desc="$(translate_gender "$PERSONA_GENDER_RAW")"
+  age_desc="$(translate_age "$PERSONA_AGE_RAW")"
+  negative_prompt="$(build_negative_prompt)"
+
+  if [[ "$refresh_flag" == "true" ]]; then
+    generation_model="$PRO_MODEL_NAME"
+    if [[ "$has_image" == "true" && "$has_meta" != "true" ]]; then
+      selection_reason="manual_refresh_unmanaged"
+    else
+      selection_reason="manual_refresh_pro"
+    fi
+  else
+    generation_model="$PRO_MODEL_NAME"
+    selection_reason="cache_miss"
+  fi
+
+  prepare_generation_prompts "$generation_model" "$role"
+
+  api_key_value="$(api_key_or_empty)"
+  vertex_project="$(vertex_project_or_empty)"
+  vertex_location="$(vertex_location_or_default)"
+  if [[ -z "$vertex_project" && -z "$api_key_value" ]]; then
+    rm -rf "$generation_lock"
+    die "no Vertex project or API key available for image generation"
+  fi
+
+  tmp_dir="$(mktemp -d)"
+  response_file="${tmp_dir}/response.json"
+
+  style_mode="$STYLE_MODE_NAMED"
+  if ! generate_style_image "$named_prompt" "$negative_prompt" "$response_file" "$api_key_value" "$image_path" "$tmp_dir" "$generation_model" "$vertex_project" "$vertex_location"; then
+    if [[ "$generation_model" == "$PRO_MODEL_NAME" ]] && generation_error_is_flash_recoverable; then
+      generation_model="$FLASH_MODEL_NAME"
+      prepare_generation_prompts "$generation_model" "$role"
+      selection_reason="${selection_reason}_flash_fallback"
+      generate_style_image "$named_prompt" "$negative_prompt" "$response_file" "$api_key_value" "$image_path" "$tmp_dir" "$generation_model" "$vertex_project" "$vertex_location" || {
+        rm -rf "$tmp_dir"
+        rm -rf "$generation_lock"
+        die "image generation did not produce a usable text-free image"
+      }
+    else
+      style_mode="$STYLE_MODE_FALLBACK"
+      : > "$response_file"
+      if ! generate_style_image "$fallback_prompt" "$negative_prompt" "$response_file" "$api_key_value" "$image_path" "$tmp_dir" "$generation_model" "$vertex_project" "$vertex_location"; then
+        if [[ "$generation_model" == "$PRO_MODEL_NAME" ]] && generation_error_is_flash_recoverable; then
+          generation_model="$FLASH_MODEL_NAME"
+          prepare_generation_prompts "$generation_model" "$role"
+          selection_reason="${selection_reason}_flash_fallback"
+          generate_style_image "$fallback_prompt" "$negative_prompt" "$response_file" "$api_key_value" "$image_path" "$tmp_dir" "$generation_model" "$vertex_project" "$vertex_location" || {
+            rm -rf "$tmp_dir"
+            rm -rf "$generation_lock"
+            die "image generation did not produce a usable text-free image"
+          }
+        else
+          rm -rf "$tmp_dir"
+          rm -rf "$generation_lock"
+          die "image generation did not produce a usable text-free image"
+        fi
+      fi
+    fi
+  fi
+
+  if [[ "$style_mode" == "$STYLE_MODE_NAMED" ]]; then
+    write_sidecar "$meta_path" "$project" "$role" "$style_mode" "$named_prompt" "$negative_prompt" "$persona_line" "$image_path" "$response_file" "$gender_desc" "$age_desc" "$generation_model" "$generation_prompt_version" "$generation_prompt_schema" "$selection_reason"
+  else
+    write_sidecar "$meta_path" "$project" "$role" "$style_mode" "$fallback_prompt" "$negative_prompt" "$persona_line" "$image_path" "$response_file" "$gender_desc" "$age_desc" "$generation_model" "$generation_prompt_version" "$generation_prompt_schema" "$selection_reason"
+  fi
+
+  rm -rf "$tmp_dir"
+  rm -rf "$generation_lock"
+  printf '%s\n' "$image_path"
+}
+
+resolve_pane_project() {
+  local project_hint="$1"
+  local pane_cwd="$2"
+  local resolved=""
+
+  if [[ -n "$project_hint" ]]; then
+    if resolved="$(normalize_dir "$project_hint" 2>/dev/null)"; then
+      printf '%s' "$resolved"
+      return 0
+    fi
+    if [[ "$project_hint" != /* ]] && [[ -d "${pane_cwd}/${project_hint}" ]]; then
+      resolved="$(normalize_dir "${pane_cwd}/${project_hint}")"
+      printf '%s' "$resolved"
+      return 0
+    fi
+  fi
+
+  if [[ -n "$pane_cwd" && -d "$pane_cwd" ]]; then
+    if resolved="$(detect_project_root "$pane_cwd" 2>/dev/null)"; then
+      printf '%s' "$resolved"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+install_sync_hooks() {
+  local session="$1"
+  local fast_hook_cmd=""
+  local full_hook_cmd=""
+  local hook_log=""
+  local fast_hooks=(
+    window-layout-changed
+    window-resized
+    client-resized
+    after-resize-pane
+    after-resize-window
+    after-select-layout
+    after-swap-pane
+  )
+  local full_hooks=(
+    after-split-window
+    after-kill-pane
+  )
+  local hook_name=""
+
+  hook_log="$(hook_log_path "$session")"
+  mkdir -p "$WORK_ROOT"
+  : >> "$hook_log"
+
+  fast_hook_cmd="'$(single_quote_escape "$SCRIPT_PATH")' sync --session '$(single_quote_escape "$session")' --fast >/dev/null 2>>'$(single_quote_escape "$hook_log")' || true"
+  full_hook_cmd="'$(single_quote_escape "$SCRIPT_PATH")' sync --session '$(single_quote_escape "$session")' >/dev/null 2>>'$(single_quote_escape "$hook_log")' || true"
+
+  for hook_name in "${fast_hooks[@]}"; do
+    tmux set-hook -t "$session" "$hook_name" "run-shell -b \"${fast_hook_cmd}\"" >/dev/null 2>&1 || true
+  done
+  for hook_name in "${full_hooks[@]}"; do
+    tmux set-hook -t "$session" "$hook_name" "run-shell -b \"${full_hook_cmd}\"" >/dev/null 2>&1 || true
+  done
+}
+
+resolve_cached_background() {
+  local project="$1"
+  local role="$2"
+  local image_path=""
+  local meta_path=""
+
+  image_path="$(project_image_path "$project" "$role")"
+  meta_path="$(project_meta_path "$project" "$role")"
+  [[ -s "$image_path" ]] || return 1
+  [[ -s "$meta_path" ]] || meta_path=""
+  printf '%s\t%s\n' "$image_path" "$meta_path"
+}
+
+pick_manifest_image_candidate() {
+  local manifest_path="$1"
+  local candidate=""
+  shift
+
+  [[ -s "$manifest_path" ]] || return 1
+  candidate="$(jq -r "$@" "$manifest_path" 2>/dev/null | head -n 1)"
+  [[ -n "$candidate" && "$candidate" != "null" && -s "$candidate" ]] || return 1
+  printf '%s' "$candidate"
+}
+
+resolve_placeholder_background() {
+  local project="$1"
+  local role="$2"
+  local pane_id="${3:-}"
+  local candidate=""
+
+  if [[ -n "$pane_id" ]]; then
+    candidate="$(pick_manifest_image_candidate "$CURRENT_MANIFEST" \
+      --arg pane_id "$pane_id" --arg project "$project" --arg role "$role" \
+      '.panes[] | select((.pane_id // "") == $pane_id and (.project // "") == $project and (.role // "") == $role and (.image_path // "") != "") | .image_path' \
+      2>/dev/null || true)"
+    if [[ -n "$candidate" && -s "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  fi
+
+  candidate="$(pick_manifest_image_candidate "$CURRENT_MANIFEST" \
+    --arg project "$project" --arg role "$role" \
+    '.panes[] | select((.project // "") == $project and (.role // "") == $role and (.image_path // "") != "") | .image_path' \
+    2>/dev/null || true)"
+  if [[ -n "$candidate" && -s "$candidate" ]]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+
+  candidate="$(runtime_placeholder_path "$role")"
+  if [[ -s "$candidate" ]]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+
+  if candidate="$(ensure_runtime_placeholder "$role" 2>/dev/null)"; then
+    [[ -n "$candidate" && -s "$candidate" ]] || return 1
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+
+  return 1
+}
+
+schedule_generation_retry() {
+  local session="$1"
+  local project="$2"
+  local role="$3"
+  local hook_log=""
+  local lock_dir=""
+  local lock_mtime=""
+  local now_epoch=""
+
+  hook_log="$(hook_log_path "$session")"
+  lock_dir="$(generation_retry_lock_dir "$session" "$project" "$role")"
+  mkdir -p "$WORK_ROOT"
+
+  if [[ -d "$lock_dir" ]]; then
+    lock_mtime="$(stat -f '%m' "$lock_dir" 2>/dev/null || printf '0')"
+    now_epoch="$(date +%s)"
+    if [[ "$lock_mtime" =~ ^[0-9]+$ ]] && (( now_epoch - lock_mtime > 300 )); then
+      rm -rf "$lock_dir"
+    fi
+  fi
+  if [[ -d "$lock_dir" ]]; then
+    return 0
+  fi
+  if ! mkdir "$lock_dir" 2>/dev/null; then
+    return 0
+  fi
+
+  nohup "$SCRIPT_PATH" retry-worker \
+    --session "$session" \
+    --project "$project" \
+    --role "$role" \
+    >>"$hook_log" 2>&1 &
+}
+
+retry_generate_background() {
+  local session="$1"
+  local project="$2"
+  local role="$3"
+  local lock_dir=""
+  local generated_image_path=""
+  local generated_meta_path=""
+  local delay=""
+  local -a retry_delays=(10 30 90)
+
+  lock_dir="$(generation_retry_lock_dir "$session" "$project" "$role")"
+  mkdir -p "$WORK_ROOT"
+  if [[ ! -d "$lock_dir" ]]; then
+    if ! mkdir "$lock_dir" 2>/dev/null; then
+      return 0
+    fi
+  fi
+
+  trap "rm -rf '${lock_dir}'" EXIT
+
+  for delay in "${retry_delays[@]}"; do
+    sleep "$delay"
+
+    if ! tmux has-session -t "$session" >/dev/null 2>&1; then
+      warn "retry worker: tmux session vanished for ${project} (${role}); stopping retries"
+      return 0
+    fi
+
+    if generated_image_path="$(generate_background "$project" "$role" "false")"; then
+      generated_meta_path="$(project_meta_path "$project" "$role")"
+      if [[ -s "$generated_image_path" && -s "$generated_meta_path" ]]; then
+        if ! "$SCRIPT_PATH" sync --session "$session" --fast >/dev/null; then
+          warn "retry worker: generated ${project} (${role}) but failed to refresh manifest"
+        fi
+        warn "retry worker: generated ${project} (${role}) and refreshed manifest"
+        return 0
+      fi
+    fi
+
+    warn "retry worker: image generation failed for ${project} (${role}); next retry pending"
+  done
+
+  warn "retry worker: exhausted retries for ${project} (${role}); keeping placeholder"
+  return 0
+}
+
+update_manifest_pane_assets() {
+  local panes_array_file="$1"
+  local pane_id="$2"
+  local image_path="$3"
+  local meta_path="$4"
+  local tmp_file=""
+
+  tmp_file="$(mktemp "${panes_array_file}.tmp.XXXXXX")"
+
+  jq \
+    --arg pane_id "$pane_id" \
+    --arg image_path "$image_path" \
+    --arg meta_path "$meta_path" \
+    'map(
+      if .pane_id == $pane_id then
+        .image_path = (if $image_path == "" then null else $image_path end)
+        | .image_meta_path = (if $meta_path == "" then null else $meta_path end)
+      else
+        .
+      end
+    )' "$panes_array_file" > "$tmp_file"
+  mv "$tmp_file" "$panes_array_file"
+}
+
+write_manifest() {
+  local session="$1"
+  local manifest_path="$2"
+  local panes_array_file="$3"
+  local window_name="$4"
+  local window_layout="$5"
+  local window_width="$6"
+  local window_height="$7"
+  local manifest_tmp=""
+
+  manifest_tmp="$(mktemp "${manifest_path}.tmp.XXXXXX")"
+
+  jq -n \
+    --arg session "$session" \
+    --arg window "$window_name" \
+    --arg window_layout "$window_layout" \
+    --arg generated_at "$(now_utc)" \
+    --arg script_path "$SCRIPT_PATH" \
+    --arg current_manifest "$CURRENT_MANIFEST" \
+    --arg opacity "$DEFAULT_OPACITY" \
+    --argjson window_width "$window_width" \
+    --argjson window_height "$window_height" \
+    --slurpfile panes "$panes_array_file" \
+    '{
+      version: 1,
+      session: $session,
+      window: $window,
+      generated_at: $generated_at,
+      source_script: $script_path,
+      current_manifest: $current_manifest,
+      default_opacity: ($opacity | tonumber),
+      window_layout: $window_layout,
+      window_cells: {
+        width: $window_width,
+        height: $window_height
+      },
+      panes: $panes[0]
+    }' > "$manifest_tmp"
+  mv "$manifest_tmp" "$manifest_path"
+  cp "$manifest_path" "${CURRENT_MANIFEST}.tmp"
+  mv "${CURRENT_MANIFEST}.tmp" "$CURRENT_MANIFEST"
+}
+
+sync_session() {
+  local session="$1"
+  local sync_mode="${2:-full}"
+  local target="${session}:dev"
+  local lock_dir=""
+  local pending_file=""
+  local tmp_dir=""
+  local panes_jsonl=""
+  local panes_array_file=""
+  local pane_rows_file=""
+  local pending_generate_file=""
+  local manifest_path=""
+  local meta_path=""
+  local dims=""
+  local window_width=""
+  local window_height=""
+  local window_name=""
+  local window_layout=""
+  local pane_id=""
+  local pane_left=""
+  local pane_top=""
+  local pane_width=""
+  local pane_height=""
+  local pane_cwd=""
+  local tmux_role=""
+  local pane_alias=""
+  local pane_column=""
+  local project_hint=""
+  local role=""
+  local project=""
+  local image_path=""
+  local asset_fields=""
+  local placeholder_path=""
+  local pending_pane_id=""
+  local pending_project=""
+  local pending_role=""
+  local generated_image_path=""
+  local generated_meta_path=""
+  local lock_mtime=""
+  local now_epoch=""
+
+  require_cmd tmux
+  require_cmd jq
+  require_cmd shasum
+
+  tmux has-session -t "$session" >/dev/null 2>&1 || die "tmux session not found: $session"
+  tmux list-windows -t "$target" >/dev/null 2>&1 || die "tmux window not found: ${target}"
+  prime_session_api_env "$session"
+  hydrate_api_env_from_session "$session"
+
+  mkdir -p "$WORK_ROOT"
+  ensure_all_runtime_placeholders
+  lock_dir="${WORK_ROOT}/lock.$(safe_name "$session")"
+  pending_file="${WORK_ROOT}/pending.$(safe_name "$session")"
+  if [[ -d "$lock_dir" ]]; then
+    lock_mtime="$(stat -f '%m' "$lock_dir" 2>/dev/null || printf '0')"
+    now_epoch="$(date +%s)"
+    if [[ "$lock_mtime" =~ ^[0-9]+$ ]] && (( now_epoch - lock_mtime > 120 )); then
+      rm -rf "$lock_dir"
+    fi
+  fi
+  if ! mkdir "$lock_dir" 2>/dev/null; then
+    : > "$pending_file"
+    printf '%s\n' "${WORK_ROOT}/$(safe_name "$session").json"
+    return 0
+  fi
+
+  manifest_path="${WORK_ROOT}/$(safe_name "$session").json"
+
+  install_sync_hooks "$session"
+  while true; do
+    rm -f "$pending_file"
+
+    tmp_dir="$(mktemp -d)"
+    panes_jsonl="${tmp_dir}/panes.jsonl"
+    panes_array_file="${tmp_dir}/panes-array.json"
+    pane_rows_file="${tmp_dir}/pane-rows.txt"
+    pending_generate_file="${tmp_dir}/pending-generate.txt"
+    : > "$panes_jsonl"
+    : > "$pending_generate_file"
+
+    dims="$(tmux display-message -p -t "$target" '#{window_width}	#{window_height}	#{window_name}	#{window_layout}')"
+    IFS=$'\t' read -r window_width window_height window_name window_layout <<< "$dims"
+
+    tmux list-panes -t "$target" -F '#{pane_id}|#{pane_left}|#{pane_top}|#{pane_width}|#{pane_height}|#{pane_current_path}|#{@role}|#{@alias}|#{@column}|#{@project}' > "$pane_rows_file"
+
+    while IFS='|' read -r pane_id pane_left pane_top pane_width pane_height pane_cwd tmux_role pane_alias pane_column project_hint <&3; do
+      [[ -n "$pane_id" ]] || continue
+      if ! role="$(classify_tmux_role "$tmux_role" 2>/dev/null)"; then
+        continue
+      fi
+
+      project=""
+      image_path=""
+      meta_path=""
+      placeholder_path=""
+
+      if project="$(resolve_pane_project "$project_hint" "$pane_cwd" 2>/dev/null)"; then
+        if asset_fields="$(resolve_cached_background "$project" "$role" 2>/dev/null)"; then
+          IFS=$'\t' read -r image_path meta_path <<< "$asset_fields"
+          if [[ -z "$meta_path" && "$sync_mode" != "fast" ]]; then
+            printf '%s|%s|%s\n' "$pane_id" "$project" "$role" >> "$pending_generate_file"
+          fi
+        else
+          if placeholder_path="$(resolve_placeholder_background "$project" "$role" "$pane_id" 2>/dev/null)"; then
+            image_path="$placeholder_path"
+          fi
+          if [[ "$sync_mode" != "fast" ]]; then
+            printf '%s|%s|%s\n' "$pane_id" "$project" "$role" >> "$pending_generate_file"
+          fi
+        fi
+      else
+        warn "could not resolve project for pane ${pane_id}"
+      fi
+
+      jq -n \
+        --arg pane_id "$pane_id" \
+        --arg tmux_role "$tmux_role" \
+        --arg role "$role" \
+        --arg alias "$pane_alias" \
+        --arg column "$pane_column" \
+        --arg pane_cwd "$pane_cwd" \
+        --arg project "${project:-}" \
+        --arg image_path "${image_path:-}" \
+        --arg meta_path "${meta_path:-}" \
+        --arg opacity "$DEFAULT_OPACITY" \
+        --argjson left "$pane_left" \
+        --argjson top "$pane_top" \
+        --argjson width "$pane_width" \
+        --argjson height "$pane_height" \
+        '{
+          pane_id: $pane_id,
+          tmux_role: $tmux_role,
+          role: $role,
+          alias: (if $alias == "" then null else $alias end),
+          column: (if $column == "" then null else $column end),
+          pane_cwd: $pane_cwd,
+          project: (if $project == "" then null else $project end),
+          left: $left,
+          top: $top,
+          width: $width,
+          height: $height,
+          image_path: (if $image_path == "" then null else $image_path end),
+          image_meta_path: (if $meta_path == "" then null else $meta_path end),
+          opacity: ($opacity | tonumber)
+        }' >> "$panes_jsonl"
+    done 3< "$pane_rows_file"
+
+    jq -s '.' "$panes_jsonl" > "$panes_array_file"
+    write_manifest "$session" "$manifest_path" "$panes_array_file" "$window_name" "$window_layout" "$window_width" "$window_height"
+    tmux set-environment -t "$session" TPROJ_PANE_BG_ENABLE 1
+    tmux set-environment -t "$session" TPROJ_PANE_BG_MANIFEST "$manifest_path"
+
+    if [[ "$sync_mode" != "fast" && -s "$pending_generate_file" ]]; then
+      while IFS='|' read -r pending_pane_id pending_project pending_role; do
+        [[ -n "$pending_pane_id" && -n "$pending_project" && -n "$pending_role" ]] || continue
+        if generated_image_path="$(generate_background "$pending_project" "$pending_role" "false")"; then
+          generated_meta_path="$(project_meta_path "$pending_project" "$pending_role")"
+          update_manifest_pane_assets "$panes_array_file" "$pending_pane_id" "$generated_image_path" "$generated_meta_path"
+          write_manifest "$session" "$manifest_path" "$panes_array_file" "$window_name" "$window_layout" "$window_width" "$window_height"
+          tmux set-environment -t "$session" TPROJ_PANE_BG_ENABLE 1
+          tmux set-environment -t "$session" TPROJ_PANE_BG_MANIFEST "$manifest_path"
+        else
+          warn "image generation failed for ${pending_project} (${pending_role}); keeping placeholder"
+          schedule_generation_retry "$session" "$pending_project" "$pending_role"
+        fi
+      done < "$pending_generate_file"
+    fi
+
+    rm -rf "$tmp_dir"
+
+    [[ -e "$pending_file" ]] || break
+  done
+
+  if [[ "$sync_mode" != "fast" ]]; then
+    while IFS='|' read -r fb_pane_id fb_project fb_role; do
+      [[ -n "$fb_pane_id" ]] || continue
+      schedule_generation_retry "$session" "$fb_project" "$fb_role"
+    done < <(jq -r '.panes[] | select(.image_path != null and (.image_path | test("fallback-"))) | "\(.pane_id)|\(.project)|\(.role)"' "$manifest_path" 2>/dev/null)
+  fi
+
+  rm -f "$pending_file"
+  rm -rf "$lock_dir"
+  printf '%s\n' "$manifest_path"
+}
+
+cmd_generate() {
+  local project=""
+  local role=""
+  local refresh="false"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --project)
+        [[ $# -ge 2 ]] || die "missing value for --project"
+        project="$2"
+        shift 2
+        ;;
+      --role)
+        [[ $# -ge 2 ]] || die "missing value for --role"
+        role="$2"
+        shift 2
+        ;;
+      --refresh)
+        refresh="true"
+        shift
+        ;;
+      -h|--help)
+        usage
+        return 0
+        ;;
+      *)
+        die "unknown option for generate: $1"
+        ;;
+    esac
+  done
+
+  [[ -n "$project" ]] || die "generate requires --project"
+  [[ "$role" == "cc" || "$role" == "cdx" ]] || die "generate requires --role cc|cdx"
+  generate_background "$project" "$role" "$refresh"
+}
+
+cmd_sync() {
+  local session=""
+  local sync_mode="full"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --session)
+        [[ $# -ge 2 ]] || die "missing value for --session"
+        session="$2"
+        shift 2
+        ;;
+      --fast)
+        sync_mode="fast"
+        shift
+        ;;
+      -h|--help)
+        usage
+        return 0
+        ;;
+      *)
+        die "unknown option for sync: $1"
+        ;;
+    esac
+  done
+
+  [[ -n "$session" ]] || die "sync requires --session"
+  sync_session "$session" "$sync_mode"
+}
+
+cmd_retry_worker() {
+  local session=""
+  local project=""
+  local role=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --session)
+        [[ $# -ge 2 ]] || die "missing value for --session"
+        session="$2"
+        shift 2
+        ;;
+      --project)
+        [[ $# -ge 2 ]] || die "missing value for --project"
+        project="$2"
+        shift 2
+        ;;
+      --role)
+        [[ $# -ge 2 ]] || die "missing value for --role"
+        role="$2"
+        shift 2
+        ;;
+      *)
+        die "unknown option for retry-worker: $1"
+        ;;
+    esac
+  done
+
+  [[ -n "$session" ]] || die "retry-worker requires --session"
+  [[ -n "$project" ]] || die "retry-worker requires --project"
+  [[ "$role" == "cc" || "$role" == "cdx" ]] || die "retry-worker requires --role cc|cdx"
+
+  prime_session_api_env "$session"
+  hydrate_api_env_from_session "$session"
+  retry_generate_background "$session" "$project" "$role"
+}
+
+cmd_hook() {
+  local session=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --session)
+        [[ $# -ge 2 ]] || die "missing value for --session"
+        session="$2"
+        shift 2
+        ;;
+      --window|--mode|--root|--remote-host)
+        [[ $# -ge 2 ]] || die "missing value for $1"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        return 0
+        ;;
+      *)
+        die "unknown hook option: $1"
+        ;;
+    esac
+  done
+
+  [[ -n "$session" ]] || die "hook invocation requires --session"
+  sync_session "$session" "full"
+}
+
+main() {
+  mkdir -p "$WORK_ROOT"
+  case "${1:-}" in
+    generate)
+      shift
+      cmd_generate "$@"
+      ;;
+    sync)
+      shift
+      cmd_sync "$@"
+      ;;
+    retry-worker)
+      shift
+      cmd_retry_worker "$@"
+      ;;
+    --*)
+      cmd_hook "$@"
+      ;;
+    -h|--help|"")
+      usage
+      ;;
+    *)
+      die "unknown command: $1"
+      ;;
+  esac
+}
+
+main "$@"
