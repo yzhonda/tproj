@@ -17,6 +17,7 @@ plans/
 
 # CC persona (auto-generated)
 .persona.md
+*.voice.json
 
 # Cdx persona / config (user-specific)
 .codex/
@@ -30,9 +31,10 @@ AGENTS.md
 config/claude/
 config/codex/
 
-# Developer logs
+# Developer logs and notes
 docs/log/
-docs/
+docs/ask/
+docs/reference/
 
 # Swift build artifacts
 .build/

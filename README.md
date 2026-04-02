@@ -14,6 +14,9 @@ Spin up a structured terminal layout with Claude Code, Codex, and yazi side by s
 
 ## Requirements
 
+- **macOS** (CLI core works on any tmux-capable OS; GUI app and memory extension are macOS-only)
+- tmux, yazi, bat, yq, node/npm, git
+
 ```bash
 brew install git tmux yazi bat yq node
 npm install -g @anthropic-ai/claude-code @openai/codex
@@ -21,13 +24,30 @@ npm install -g @anthropic-ai/claude-code @openai/codex
 
 ## Install
 
+The installer copies scripts to `~/bin/` and overwrites the following config files (existing files are backed up automatically):
+
+- `~/.tmux.conf`
+- `~/.config/yazi/` (yazi.toml, keymap.toml, package.toml)
+- Optionally appends a `PATH` entry to `~/.zshrc` or `~/.bashrc`
+
 ```bash
 git clone https://github.com/usedhonda/tproj.git
 cd tproj
+
+# Preview what will be changed (no modifications)
+./install.sh --dry-run
+
+# Full install: core + default extensions
 ./install.sh
+
+# Minimal install: core scripts only, no config overwrites
+./install.sh --core-only
+
+# Everything including memory watchdog daemon
+./install.sh --all
 ```
 
-The installer places scripts in `~/bin` and configuration under `~/.config`.
+Run `./install.sh -h` for all options.
 
 ## Usage
 
@@ -93,36 +113,22 @@ A native SwiftUI app for session control and monitoring.
 
 ```bash
 cd apps/tproj
-swift build
-./build-app.sh       # creates dist/tproj.app
-open dist/tproj.app
+./dev-app.sh           # debug build + launch
+./dev-app.sh --release # release build (universal binary + app bundle)
 ```
 
 The GUI auto-launches when `tproj` starts a session. Configure `gui.app_path` in `workspace.yaml` to pin a specific build.
 
-## Extension hooks
-
-tproj supports hooks for customization:
-
-| Environment variable | Purpose | Example |
-|---------------------|---------|---------|
-| `TPROJ_LABEL_HOOK` | Custom pane label generator | `export TPROJ_LABEL_HOOK=my-label-script` |
-| `TPROJ_GUI_APP_PATH` | Override GUI app location | `export TPROJ_GUI_APP_PATH=~/Apps/tproj.app` |
-
-### `TPROJ_LABEL_HOOK`
-
-When set, tproj calls `$TPROJ_LABEL_HOOK --label <project_path> <cc|cdx>` to generate a suffix for pane titles. This lets you add persona labels, status indicators, or any custom text to your pane titles.
-
 ## Extensions
 
-tproj ships with optional extensions installed by default (except memory).
+tproj ships with optional extensions. All except memory are installed by default.
 
-| Extension | What it does | Install |
-|-----------|-------------|---------|
-| **messaging** | Inter-pane AI messaging (tproj-msg) | default |
-| **persona** | Deterministic AI persona generation + pane backgrounds | default |
-| **agent-teams** | Claude Code Agent Teams pane management | default |
-| **memory** | Memory monitoring + watchdog daemon | `--with-memory` |
+| Extension | What it does | Default | Side effects |
+|-----------|-------------|---------|--------------|
+| **messaging** | Inter-pane AI messaging (`tproj-msg`) | yes | Installs `msg` skill to `~/.claude/skills/` and `~/.codex/skills/` |
+| **persona** | Deterministic AI persona generation + pane backgrounds | yes | Generates per-project config (`.persona.md`, `.codex/config.toml`, `.cc-status-bar.voice.json`) |
+| **agent-teams** | Claude Code Agent Teams pane management | yes | Requires `teammateMode: "tmux"` in Claude Code settings |
+| **memory** | Memory monitoring + watchdog daemon (macOS) | no | Installs a launchd daemon that monitors and can terminate processes |
 
 ```bash
 ./install.sh              # core + messaging + persona + agent-teams
@@ -131,6 +137,20 @@ tproj ships with optional extensions installed by default (except memory).
 ```
 
 See each extension's README under `extensions/` for details.
+
+## Extension hooks
+
+tproj supports hooks for customization:
+
+| Environment variable | Purpose | Example |
+|---------------------|---------|---------|
+| `TPROJ_LABEL_HOOK` | Custom pane label generator | `export TPROJ_LABEL_HOOK=cc-persona` |
+| `TPROJ_GUI_APP_PATH` | Override GUI app location | `export TPROJ_GUI_APP_PATH=~/Apps/tproj.app` |
+| `TPROJ_AFTER_LAYOUT_HOOK` | Run after layout is set up | `export TPROJ_AFTER_LAYOUT_HOOK=tproj-pane-bg` |
+
+### `TPROJ_LABEL_HOOK`
+
+When set, tproj calls `$TPROJ_LABEL_HOOK --label <project_path> <cc|cdx>` to generate a suffix for pane titles. This lets you add persona labels, status indicators, or any custom text to your pane titles.
 
 ## Repository layout
 

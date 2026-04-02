@@ -3,109 +3,20 @@
 # Copy this file to:
 #   ~/.config/tproj/workspace.yaml
 #
-# Example:
+# Quick start:
 #   mkdir -p ~/.config/tproj
 #   cp config/workspace.yaml.example ~/.config/tproj/workspace.yaml
-#
-# After editing this file, run:
-#   tproj
-#
-# Check configured projects with:
-#   tproj --check
+#   # edit the projects list below, then run: tproj
 
-# ===== Optional global launch args =====
+# ===== Minimal example =====
 #
-# These apply to both workspace mode and single-project mode.
-# They append to the built-in launcher command; they do not replace it.
-#
-# launch:
-#   claude:
-#     args:
-#       - --model
-#       - sonnet
-#   codex:
-#     args:
-#       - -m
-#       - gpt-5.3-codex
-#
-# ===== Optional tmux UI overrides =====
-#
-# These apply to tproj-created tmux windows only.
-# Values are tmux style tokens (for example: colour51, colour248, default, terminal).
-#
-# tmux_ui:
-#   pane_border:
-#     active_fg: colour51
-#     active_bold: true
-#     inactive_fg: colour248
-#     prev1_fg: colour211
-#     prev2_fg: colour175
-#   pane_title:
-#     active_prefix: "▶ "
-#     active_fg: colour255
-#     active_bg: colour236
-#     inactive_prefix: "  "
-#     inactive_fg: colour255
-#     inactive_bg: colour238
-#     prev1_fg: colour211
-#     prev1_bg: colour237
-#     prev2_fg: colour175
-#     prev2_bg: colour237
-#   window_text:
-#     active_fg: default
-#     active_bg: terminal
-#     inactive_fg: colour250
-#     inactive_bg: terminal
-
-# ===== Simple format (local projects only) =====
-#
-# A plain list of project paths.
-# Every entry is treated as:
-#   type: local
-#   enabled: true
+# Just list your projects. Everything else is optional.
 #
 # projects:
-#   - /Users/<username>/projects/claude/tproj
-#   - /Users/<username>/projects/claude/statusline
-#   - /Users/<username>/projects/claude/cc-status-bar
-#
-# Do not mix simple and detailed formats.
+#   - /Users/you/projects/frontend
+#   - /Users/you/projects/backend
 
-# ===== Optional GUI settings =====
-#
-# gui:
-#   keep_alive: true    # default true:
-#                       # tproj stop/kill does not close GUI
-#                       # false closes GUI on stop/kill
-#
-#   # Optional fixed GUI app path (recommended for development)
-#   # Accepts either:
-#   #   /path/to/tproj.app
-#   #   /path/to/tproj.app/Contents/MacOS/tproj
-#   app_path: /Users/<username>/projects/claude/tproj/apps/tproj/dist/tproj.app
-#
-#   # Extra directories to add to the GUI app's PATH
-#   # Builtin defaults (~/bin, /opt/homebrew/bin, /usr/local/bin) are always included
-#   extra_paths:
-#     - /opt/custom/bin
-#     # - /another/path
-#
-#   # Commands checked at startup; missing ones show hints in the UI
-#   # Builtin defaults: tmux (required), yq (optional)
-#   dependencies:
-#     - name: tmux
-#       required: true
-#       hint: brew install tmux
-#     - name: yq
-#       required: false
-#       hint: brew install yq
-#
-#   # External bridge for inter-pane messaging (optional, used by tproj-msg)
-#   bridge:
-#     url: http://localhost:8765    # Bridge server URL
-#     default_adapter: direct       # Default adapter
-
-# ===== Detailed format (local + remote) =====
+# ===== Detailed format (aliases, remote, disabled) =====
 
 projects:
   # Local project (enabled at startup)
@@ -141,6 +52,86 @@ projects:
 #           false means excluded at startup but available via --add.
 #           When a workspace session is stopped from the GUI, the current running set
 #           is written back here and becomes the next manual Start set.
+
+# ===== Advanced options =====
+#
+# --- Global launch args ---
+#
+# These apply to both workspace mode and single-project mode.
+# They append to the built-in launcher command; they do not replace it.
+#
+# launch:
+#   claude:
+#     args:
+#       - --model
+#       - sonnet
+#   codex:
+#     args:
+#       - -m
+#       - gpt-5.3-codex
+#
+# --- tmux UI overrides ---
+#
+# These apply to tproj-created tmux windows only.
+# Values are tmux style tokens (for example: colour51, colour248, default, terminal).
+#
+# tmux_ui:
+#   pane_border:
+#     active_fg: colour51
+#     active_bold: true
+#     inactive_fg: colour248
+#     prev1_fg: colour211
+#     prev2_fg: colour175
+#   pane_title:
+#     active_prefix: "▶ "
+#     active_fg: colour255
+#     active_bg: colour236
+#     inactive_prefix: "  "
+#     inactive_fg: colour255
+#     inactive_bg: colour238
+#     prev1_fg: colour211
+#     prev1_bg: colour237
+#     prev2_fg: colour175
+#     prev2_bg: colour237
+#   window_text:
+#     active_fg: default
+#     active_bg: terminal
+#     inactive_fg: colour250
+#     inactive_bg: terminal
+#
+# --- GUI settings ---
+#
+# gui:
+#   keep_alive: true    # default true:
+#                       # tproj stop/kill does not close GUI
+#                       # false closes GUI on stop/kill
+#
+#   # Optional fixed GUI app path (recommended for development)
+#   # Accepts either:
+#   #   /path/to/tproj.app
+#   #   /path/to/tproj.app/Contents/MacOS/tproj
+#   app_path: /Users/<username>/projects/claude/tproj/apps/tproj/dist/tproj.app
+#
+#   # Extra directories to add to the GUI app's PATH
+#   # Builtin defaults (~/bin, /opt/homebrew/bin, /usr/local/bin) are always included
+#   extra_paths:
+#     - /opt/custom/bin
+#     # - /another/path
+#
+#   # Commands checked at startup; missing ones show hints in the UI
+#   # Builtin defaults: tmux (required), yq (optional)
+#   dependencies:
+#     - name: tmux
+#       required: true
+#       hint: brew install tmux
+#     - name: yq
+#       required: false
+#       hint: brew install yq
+#
+#   # External bridge for inter-pane messaging (optional, used by tproj-msg)
+#   bridge:
+#     url: http://localhost:8765    # Bridge server URL
+#     default_adapter: direct       # Default adapter
 
 # ===== Recommended limits =====
 #

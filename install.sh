@@ -1,12 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
-# tproj インストーラ
-# 使い方: ./install.sh [-h] [-n] [-y]
+# tproj installer
+# Usage: ./install.sh [-h] [-n] [-y]
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# ========== オプション ==========
+# ========== Options ==========
 
 DRY_RUN=false
 AUTO_YES=false
@@ -73,9 +73,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# ========== ヘルパー関数 ==========
+# ========== Helper functions ==========
 
-# ドライラン対応のコマンド実行
+# Dry-run aware command execution
 run_cmd() {
   if $DRY_RUN; then
     echo "[DRY-RUN] $*"
@@ -84,7 +84,7 @@ run_cmd() {
   fi
 }
 
-# Y/n 確認（-y で自動Yes）
+# Y/n confirmation (-y to auto-accept)
 confirm() {
   local prompt=$1
   if $AUTO_YES; then
@@ -115,21 +115,21 @@ backup_if_exists() {
   if [[ -f "$file" && ! -L "$file" ]]; then
     local backup="${file}.bak.$(date +%Y%m%d_%H%M%S)"
     if $DRY_RUN; then
-      echo "[DRY-RUN] 📋 バックアップ: $file -> $backup"
+      echo "[DRY-RUN] Backup: $file -> $backup"
     else
       cp "$file" "$backup"
-      echo "  📋 バックアップ: $backup"
+      echo "  Backup: $backup"
     fi
   fi
 }
 
-# ========== 1. 依存関係チェック ==========
+# ========== 1. Dependency check ==========
 
-echo "🔍 依存関係を確認中..."
+echo "Checking dependencies..."
 
-# brew でインストール可能なツール
+# Tools installable via brew
 BREW_DEPS=(npm:node git tmux yazi bat yq)
-# npm でインストールするツール
+# Tools installable via npm
 NPM_DEPS=(claude:@anthropic-ai/claude-code codex:@openai/codex)
 
 MISSING_BREW=()
@@ -154,16 +154,16 @@ for dep in "${NPM_DEPS[@]}"; do
   fi
 done
 
-# ========== 2. 不足ツールのインストール ==========
+# ========== 2. Install missing tools ==========
 
 if [[ ${#MISSING_BREW[@]} -gt 0 ]]; then
   echo ""
-  echo "❌ 以下のツールがありません: ${MISSING_BREW[*]}"
+  echo "Missing tools: ${MISSING_BREW[*]}"
 
   if command -v brew &> /dev/null; then
-    if confirm "🍺 brewでインストールしますか？"; then
+    if confirm "Install with brew?"; then
       for pkg in "${MISSING_BREW[@]}"; do
-        echo "📦 brew install $pkg"
+        echo "  brew install $pkg"
         if ! $DRY_RUN; then
           brew install "$pkg"
         else
@@ -172,7 +172,7 @@ if [[ ${#MISSING_BREW[@]} -gt 0 ]]; then
       done
     else
       echo ""
-      echo "手動でインストールしてください:"
+      echo "Please install manually:"
       for pkg in "${MISSING_BREW[@]}"; do
         echo "  brew install $pkg"
       done
@@ -180,12 +180,11 @@ if [[ ${#MISSING_BREW[@]} -gt 0 ]]; then
     fi
   else
     echo ""
-    echo "⚠️  Homebrewがインストールされていません"
-    echo "   https://brew.sh を参照してインストール後、再実行してください"
+    echo "Homebrew not found. See https://brew.sh then re-run this script."
     echo ""
-    echo "   または手動でインストール:"
+    echo "Or install manually:"
     for pkg in "${MISSING_BREW[@]}"; do
-      echo "   • $pkg"
+      echo "  $pkg"
     done
     exit 1
   fi
@@ -193,15 +192,15 @@ fi
 
 if [[ ${#MISSING_NPM[@]} -gt 0 ]]; then
   echo ""
-  echo "❌ 以下のnpmパッケージがありません:"
+  echo "Missing npm packages:"
   for pkg in "${MISSING_NPM[@]}"; do
-    echo "   • $pkg"
+    echo "  $pkg"
   done
 
   if command -v npm &> /dev/null; then
-    if confirm "📦 npmでグローバルインストールしますか？"; then
+    if confirm "Install globally with npm?"; then
       for pkg in "${MISSING_NPM[@]}"; do
-        echo "📦 npm install -g $pkg"
+        echo "  npm install -g $pkg"
         if ! $DRY_RUN; then
           npm install -g "$pkg"
         else
@@ -210,7 +209,7 @@ if [[ ${#MISSING_NPM[@]} -gt 0 ]]; then
       done
     else
       echo ""
-      echo "手動でインストールしてください:"
+      echo "Please install manually:"
       for pkg in "${MISSING_NPM[@]}"; do
         echo "  npm install -g $pkg"
       done
@@ -218,49 +217,49 @@ if [[ ${#MISSING_NPM[@]} -gt 0 ]]; then
     fi
   else
     echo ""
-    echo "⚠️  npmがありません。先にnpmをインストールしてください"
+    echo "npm not found. Install Node.js first, then re-run."
     exit 1
   fi
 fi
 
 echo ""
 if $DRY_RUN; then
-  echo "🔍 tproj インストール (ドライラン)"
+  echo "tproj install (dry run)"
 else
-  echo "🚀 tproj インストール開始"
+  echo "Installing tproj..."
 fi
 
-# ========== 3. Terminfo セットアップ ==========
+# ========== 3. Terminfo setup ==========
 
 if ! infocmp xterm-ghostty &>/dev/null; then
   if $DRY_RUN; then
-    echo "[DRY-RUN] 📦 xterm-ghostty terminfo -> ~/.terminfo/"
+    echo "[DRY-RUN] xterm-ghostty terminfo -> ~/.terminfo/"
   else
-    echo "📦 xterm-ghostty terminfo -> ~/.terminfo/"
+    echo "  xterm-ghostty terminfo -> ~/.terminfo/"
     tic -x "$SCRIPT_DIR/config/terminfo/xterm-ghostty.terminfo"
   fi
 else
-  echo "✅ xterm-ghostty terminfo (already installed)"
+  echo "  xterm-ghostty terminfo (already installed)"
 fi
 
-# ========== 4. バックアップ & コピー ==========
+# ========== 4. Backup & copy ==========
 
-# 4.1 tproj スクリプト
+# 4.1 Core scripts
 CORE_BINS=(tproj tproj-drop-column tproj-kill-pane tproj-toggle-yazi tproj-pane-focus-hook tproj-pane-clear-rank tproj-pane-watchdog tproj-respawn-guard tproj-postmortem tproj-mem-trace rebalance-workspace-columns sign-codex wait-for-pane-text)
 
 if $DRY_RUN; then
   for bin_name in "${CORE_BINS[@]}"; do
-    echo "[DRY-RUN] 📦 $bin_name -> ~/bin/"
+    echo "[DRY-RUN] $bin_name -> ~/bin/"
   done
 else
-  echo "📦 Core scripts -> ~/bin/"
+  echo "  Core scripts -> ~/bin/"
   mkdir -p ~/bin
   for bin_name in "${CORE_BINS[@]}"; do
     cp "$SCRIPT_DIR/bin/$bin_name" ~/bin/"$bin_name"
     chmod +x ~/bin/"$bin_name"
   done
 
-  # Legacy cleanup: remove old launchd plist (renamed to com.tproj.memory-guard)
+  # Legacy cleanup: remove old launchd plist
   OLD_PLIST="$HOME/Library/LaunchAgents/com.memory-guard.plist"
   # Always try bootout (plist may be loaded even if file was already deleted)
   launchctl bootout "gui/$(id -u)/com.memory-guard" 2>/dev/null || true
@@ -269,29 +268,29 @@ else
     echo "  removed legacy $OLD_PLIST"
   fi
 
-  # Legacy cleanup: remove stale binaries from previous installs
+  # Legacy cleanup: remove stale binaries
   for legacy_bin in tproj-gui tproj-mcp-init; do
     if [[ -f "$HOME/bin/$legacy_bin" ]]; then
       rm -f "$HOME/bin/$legacy_bin"
-      echo "  removed legacy ~/bin/$legacy_bin"
+      echo "  Removed legacy ~/bin/$legacy_bin"
     fi
   done
 fi
 
-# 4.2 tmux 設定
+# 4.2 tmux config
 backup_if_exists ~/.tmux.conf
 if $DRY_RUN; then
-  echo "[DRY-RUN] 📦 tmux.conf -> ~/.tmux.conf"
+  echo "[DRY-RUN] tmux.conf -> ~/.tmux.conf"
 else
-  echo "📦 tmux.conf -> ~/.tmux.conf"
+  echo "  tmux.conf -> ~/.tmux.conf"
   cp "$SCRIPT_DIR/config/tmux/tmux.conf" ~/.tmux.conf
 fi
 
-# 4.3 yazi 設定
+# 4.3 yazi config
 if $DRY_RUN; then
-  echo "[DRY-RUN] 📦 yazi設定 -> ~/.config/yazi/"
+  echo "[DRY-RUN] yazi config -> ~/.config/yazi/"
 else
-  echo "📦 yazi設定 -> ~/.config/yazi/"
+  echo "  yazi config -> ~/.config/yazi/"
   mkdir -p ~/.config/yazi/plugins
 fi
 backup_if_exists ~/.config/yazi/yazi.toml
@@ -304,24 +303,24 @@ if ! $DRY_RUN; then
   cp -r "$SCRIPT_DIR/config/yazi/plugins/"* ~/.config/yazi/plugins/
 fi
 
-# 4.4 yaziパッケージ（piperプラグイン）
+# 4.4 yazi plugins
 if command -v ya &> /dev/null; then
   if $DRY_RUN; then
-    echo "[DRY-RUN] 📦 yazi plugins (ya pack)"
+    echo "[DRY-RUN] yazi plugins (ya pack)"
   else
-    echo "📦 yazi plugins (ya pack)"
+    echo "  yazi plugins (ya pack)"
     if ! (cd ~/.config/yazi && ya pack -i 2>/dev/null); then
-      echo "  ⚠️  yazi plugin install failed (best-effort)."
-      echo "     Retry manually: cd ~/.config/yazi && ya pack -i"
+      echo "  Warning: yazi plugin install failed (best-effort)."
+      echo "           Retry manually: cd ~/.config/yazi && ya pack -i"
     fi
   fi
 fi
 
-# ========== 5. PATH自動設定 ==========
+# ========== 5. PATH setup ==========
 
 if [[ ":$PATH:" != *":$HOME/bin:"* ]]; then
   echo ""
-  echo "⚠️  ~/bin がPATHに含まれていません"
+  echo "~/bin is not in your PATH."
 
   SHELL_RC=""
   if [[ -f ~/.zshrc ]]; then
@@ -331,25 +330,25 @@ if [[ ":$PATH:" != *":$HOME/bin:"* ]]; then
   fi
 
   if [[ -n "$SHELL_RC" ]]; then
-    if confirm "📝 $SHELL_RC に PATH設定を追加しますか？"; then
+    if confirm "Add PATH entry to $SHELL_RC?"; then
       PATH_LINE='export PATH="$HOME/bin:$PATH"'
       if $DRY_RUN; then
-        echo "[DRY-RUN] 以下を $SHELL_RC に追加:"
+        echo "[DRY-RUN] Would add to $SHELL_RC:"
         echo "   $PATH_LINE"
       else
         echo "" >> "$SHELL_RC"
         echo "# Added by tproj installer" >> "$SHELL_RC"
         echo "$PATH_LINE" >> "$SHELL_RC"
-        echo "✅ $SHELL_RC にPATH設定を追加しました"
-        echo "   反映するには: source $SHELL_RC"
+        echo "  Added PATH to $SHELL_RC"
+        echo "  Run: source $SHELL_RC"
       fi
     else
-      echo "   以下を手動で追加してください:"
-      echo '   export PATH="$HOME/bin:$PATH"'
+      echo "  Add this to your shell profile manually:"
+      echo '  export PATH="$HOME/bin:$PATH"'
     fi
   else
-    echo "   以下を ~/.zshrc または ~/.bashrc に追加してください:"
-    echo '   export PATH="$HOME/bin:$PATH"'
+    echo "  Add this to ~/.zshrc or ~/.bashrc:"
+    echo '  export PATH="$HOME/bin:$PATH"'
   fi
 fi
 
@@ -357,12 +356,12 @@ fi
 
 if ! $CORE_ONLY; then
   echo ""
-  echo "📦 Installing extensions..."
+  echo "Installing extensions..."
   mkdir -p ~/bin
 
   # --- messaging ---
   if [[ -d "$SCRIPT_DIR/extensions/messaging" ]]; then
-    echo "  📦 messaging (tproj-msg)"
+    echo "  messaging (tproj-msg)"
     if ! $DRY_RUN; then
       cp "$SCRIPT_DIR/extensions/messaging/tproj-msg" ~/bin/
       chmod +x ~/bin/tproj-msg
@@ -378,7 +377,7 @@ if ! $CORE_ONLY; then
 
   # --- persona ---
   if [[ -d "$SCRIPT_DIR/extensions/persona" ]]; then
-    echo "  📦 persona (cc-persona, tproj-pane-bg)"
+    echo "  persona (cc-persona, tproj-pane-bg)"
     if ! $DRY_RUN; then
       cp "$SCRIPT_DIR/extensions/persona/cc-persona" ~/bin/
       cp "$SCRIPT_DIR/extensions/persona/tproj-pane-bg" ~/bin/
@@ -397,7 +396,7 @@ if ! $CORE_ONLY; then
 
   # --- agent-teams ---
   if [[ -d "$SCRIPT_DIR/extensions/agent-teams" ]]; then
-    echo "  📦 agent-teams (team-watcher, reflow-agent-pane, agent-monitor)"
+    echo "  agent-teams (team-watcher, reflow-agent-pane, agent-monitor)"
     if ! $DRY_RUN; then
       for ext_bin in team-watcher reflow-agent-pane agent-monitor; do
         cp "$SCRIPT_DIR/extensions/agent-teams/$ext_bin" ~/bin/
@@ -410,7 +409,7 @@ if ! $CORE_ONLY; then
 
   # --- memory (opt-in) ---
   if $WITH_MEMORY && [[ -d "$SCRIPT_DIR/extensions/memory" ]]; then
-    echo "  📦 memory (cc-mem, memory-guard, tproj-mem-json)"
+    echo "  memory (cc-mem, memory-guard, tproj-mem-json)"
     if ! $DRY_RUN; then
       cp "$SCRIPT_DIR/extensions/memory/cc-mem" ~/bin/
       cp "$SCRIPT_DIR/extensions/memory/memory-guard" ~/bin/
@@ -425,42 +424,50 @@ if ! $CORE_ONLY; then
         sed "s|__HOME__|$HOME|g" "$SCRIPT_DIR/extensions/memory/launchd/com.tproj.memory-guard.plist.template" > "$PLIST_FILE"
         launchctl bootout "gui/$(id -u)/com.tproj.memory-guard" 2>/dev/null || true
         launchctl bootstrap "gui/$(id -u)" "$PLIST_FILE" 2>/dev/null || true
-        echo "    ✅ memory-guard launchd daemon installed"
+        echo "    memory-guard launchd daemon installed"
       fi
     else
       echo "    [DRY-RUN] cc-mem, memory-guard, tproj-mem-json -> ~/bin/"
       echo "    [DRY-RUN] memory-guard launchd plist -> ~/Library/LaunchAgents/"
     fi
   elif ! $WITH_MEMORY && [[ -d "$SCRIPT_DIR/extensions/memory" ]]; then
-    echo "  ⏭️  memory (skipped, use --with-memory or --all to install)"
+    echo "  memory (skipped -- use --with-memory or --all to install)"
   fi
 fi
 
-# ========== 7. 完了メッセージ ==========
+# ========== 7. Done ==========
 
 echo ""
 if $DRY_RUN; then
-  echo "✅ Dry run complete (no changes made)"
+  echo "Dry run complete (no changes made)."
   echo ""
-  echo "Run for real: ./install.sh"
+  echo "Run for real:  ./install.sh"
 else
-  echo "✅ Installation complete!"
+  echo "Installation complete!"
 fi
 
 echo ""
-echo "Installed to:"
+echo "What was installed:"
 echo "   ~/bin/            core scripts"
-echo "   ~/.tmux.conf      tmux configuration"
-echo "   ~/.config/yazi/   yazi file manager"
+echo "   ~/.tmux.conf      tmux config (previous backed up)"
+echo "   ~/.config/yazi/   yazi config (previous backed up)"
 if ! $CORE_ONLY; then
   echo "   ~/bin/            extensions (messaging, persona, agent-teams)"
   $WITH_MEMORY && echo "   ~/bin/            memory extension (cc-mem, memory-guard)"
 fi
 echo ""
-echo "Usage:"
-echo "   Single project: cd <project> && tproj"
-echo "   Multi-project:  cp config/workspace.yaml.example ~/.config/tproj/workspace.yaml"
-echo "                   # edit workspace.yaml, then run tproj"
+echo "Quick start:"
+echo "   tproj --help                   show all options"
+echo "   cd <project> && tproj          single-project mode"
+echo ""
+echo "Multi-project workspace:"
+echo "   mkdir -p ~/.config/tproj"
+echo "   cp config/workspace.yaml.example ~/.config/tproj/workspace.yaml"
+echo "   # edit workspace.yaml with your projects, then:"
+echo "   tproj"
+echo ""
+echo "GUI app (macOS):"
+echo "   cd apps/tproj && ./dev-app.sh"
 if ! $CORE_ONLY; then
   echo ""
   echo "Optional environment variables (add to your shell profile):"
