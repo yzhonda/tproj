@@ -254,7 +254,10 @@ if $DRY_RUN; then
 else
   echo "  Core scripts -> ~/bin/"
   mkdir -p ~/bin
+  # Remove broken symlinks (e.g. from deleted tproj-ext)
+  find ~/bin/ -maxdepth 1 -type l ! -exec test -e {} \; -delete 2>/dev/null || true
   for bin_name in "${CORE_BINS[@]}"; do
+    rm -f ~/bin/"$bin_name"  # remove stale symlink before cp
     cp "$SCRIPT_DIR/bin/$bin_name" ~/bin/"$bin_name"
     chmod +x ~/bin/"$bin_name"
   done
@@ -379,6 +382,7 @@ if ! $CORE_ONLY; then
   if [[ -d "$SCRIPT_DIR/extensions/persona" ]]; then
     echo "  persona (cc-persona, tproj-pane-bg)"
     if ! $DRY_RUN; then
+      rm -f ~/bin/cc-persona ~/bin/tproj-pane-bg  # remove stale symlinks
       cp "$SCRIPT_DIR/extensions/persona/cc-persona" ~/bin/
       cp "$SCRIPT_DIR/extensions/persona/tproj-pane-bg" ~/bin/
       chmod +x ~/bin/cc-persona ~/bin/tproj-pane-bg
