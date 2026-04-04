@@ -441,6 +441,8 @@ voice_known_token_reading() {
     openclaw) echo "オープンクロー" ;;
     # Common English words
     music) echo "ミュージック" ;;
+    suno) echo "スノ" ;;
+    manual) echo "マニュアル" ;;
     recall) echo "リコール" ;;
     status) echo "ステータス" ;;
     bar) echo "バー" ;;
@@ -559,6 +561,7 @@ voice_project_reading() {
     "chrome-ai-bridge") echo "クロームエーアイブリッジ" ;;
     "general") echo "ジェネラル" ;;
     "music") echo "ミュージック" ;;
+    "sunomanual") echo "スノマニュアル" ;;
     "openclaw") echo "オープンクロー" ;;
     *) voice_generic_project_reading "$project_name" ;;
   esac
