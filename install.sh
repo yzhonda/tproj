@@ -380,14 +380,15 @@ if ! $CORE_ONLY; then
 
   # --- persona ---
   if [[ -d "$SCRIPT_DIR/extensions/persona" ]]; then
-    echo "  persona (cc-persona, tproj-pane-bg)"
+    echo "  persona (cc-persona, tproj-pane-bg, voicevox-alert)"
     if ! $DRY_RUN; then
-      rm -f ~/bin/cc-persona ~/bin/tproj-pane-bg  # remove stale symlinks
+      rm -f ~/bin/cc-persona ~/bin/tproj-pane-bg ~/bin/voicevox-alert  # remove stale symlinks
       cp "$SCRIPT_DIR/extensions/persona/cc-persona" ~/bin/
       cp "$SCRIPT_DIR/extensions/persona/tproj-pane-bg" ~/bin/
-      chmod +x ~/bin/cc-persona ~/bin/tproj-pane-bg
+      cp "$SCRIPT_DIR/extensions/persona/voicevox-alert" ~/bin/
+      chmod +x ~/bin/cc-persona ~/bin/tproj-pane-bg ~/bin/voicevox-alert
     else
-      echo "    [DRY-RUN] cc-persona, tproj-pane-bg -> ~/bin/"
+      echo "    [DRY-RUN] cc-persona, tproj-pane-bg, voicevox-alert -> ~/bin/"
     fi
     # Check optional deps
     if ! command -v jq &>/dev/null; then
