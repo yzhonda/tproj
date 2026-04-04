@@ -591,7 +591,7 @@ voice_cc_speaker_name() {
     "10代")
       case "${tone}:${chara}:${master}:${era}" in
         "感情的:"*|*":破天荒系:"*|*":*:崇拝的:"*)
-          echo "満別花丸"
+          echo "春日部つむぎ"
           ;;
         *":姐御肌系:"*)
           echo "波音リツ"
@@ -625,7 +625,7 @@ voice_cc_speaker_name() {
           echo "九州そら"
           ;;
         "感情的:"*|*":破天荒系:"*)
-          echo "満別花丸"
+          echo "春日部つむぎ"
           ;;
         *)
           echo "四国めたん"
@@ -657,7 +657,7 @@ voice_cc_speaker_style() {
     "10代")
       case "${tone}:${chara}:${master}:${era}" in
         "感情的:"*|*":破天荒系:"*|*":*:崇拝的:"*)
-          echo "元気"
+          echo "ノーマル"
           ;;
         *":姐御肌系:"*)
           echo "クイーン"
@@ -688,7 +688,7 @@ voice_cc_speaker_style() {
           echo "ささやき"
           ;;
         "感情的:"*|*":破天荒系:"*)
-          echo "元気"
+          echo "ノーマル"
           ;;
         *)
           echo "ノーマル"
