@@ -420,32 +420,89 @@ voice_letter_reading() {
 
 voice_known_token_reading() {
   case "$1" in
+    # Abbreviations / acronyms (spell out)
     ana) echo "エーエヌエー" ;;
     ai) echo "エーアイ" ;;
     oc) echo "オーシー" ;;
     cc) echo "シーシー" ;;
     ccsb) echo "シーシーエスビー" ;;
     cab) echo "シーエービー" ;;
-    status) echo "ステータス" ;;
-    bar) echo "バー" ;;
-    line) echo "ライン" ;;
-    statusline) echo "ステータスライン" ;;
-    general) echo "ジェネラル" ;;
-    chrome) echo "クローム" ;;
-    bridge) echo "ブリッジ" ;;
-    tproj) echo "ティープロジェイ" ;;
     ext) echo "エクスト" ;;
-    recall) echo "リコール" ;;
+    # Project names
+    tproj) echo "ティープロジ" ;;
     clawgate) echo "クロウゲート" ;;
-    claw) echo "クロウ" ;;
-    gate) echo "ゲート" ;;
     vibeterm) echo "バイブターム" ;;
-    vibe) echo "バイブ" ;;
-    term) echo "ターム" ;;
+    aillio) echo "アイリオ" ;;
     ailio) echo "アイリオ" ;;
     codex) echo "コーデックス" ;;
     claude) echo "クロード" ;;
     voicevox) echo "ボイスボックス" ;;
+    statusline) echo "ステータスライン" ;;
+    openclaw) echo "オープンクロー" ;;
+    # Common English words
+    music) echo "ミュージック" ;;
+    recall) echo "リコール" ;;
+    status) echo "ステータス" ;;
+    bar) echo "バー" ;;
+    line) echo "ライン" ;;
+    general) echo "ジェネラル" ;;
+    chrome) echo "クローム" ;;
+    bridge) echo "ブリッジ" ;;
+    claw) echo "クロウ" ;;
+    gate) echo "ゲート" ;;
+    vibe) echo "バイブ" ;;
+    term) echo "ターム" ;;
+    open) echo "オープン" ;;
+    code) echo "コード" ;;
+    app) echo "アプリ" ;;
+    test) echo "テスト" ;;
+    dev) echo "デブ" ;;
+    web) echo "ウェブ" ;;
+    api) echo "エーピーアイ" ;;
+    data) echo "データ" ;;
+    file) echo "ファイル" ;;
+    server) echo "サーバー" ;;
+    client) echo "クライアント" ;;
+    config) echo "コンフィグ" ;;
+    sync) echo "シンク" ;;
+    tool) echo "ツール" ;;
+    tools) echo "ツールズ" ;;
+    chat) echo "チャット" ;;
+    bot) echo "ボット" ;;
+    log) echo "ログ" ;;
+    note) echo "ノート" ;;
+    notes) echo "ノーツ" ;;
+    mail) echo "メール" ;;
+    shop) echo "ショップ" ;;
+    home) echo "ホーム" ;;
+    work) echo "ワーク" ;;
+    play) echo "プレイ" ;;
+    game) echo "ゲーム" ;;
+    link) echo "リンク" ;;
+    list) echo "リスト" ;;
+    dark) echo "ダーク" ;;
+    light) echo "ライト" ;;
+    fast) echo "ファスト" ;;
+    hub) echo "ハブ" ;;
+    lab) echo "ラボ" ;;
+    labs) echo "ラボズ" ;;
+    kit) echo "キット" ;;
+    map) echo "マップ" ;;
+    flow) echo "フロー" ;;
+    tree) echo "ツリー" ;;
+    view) echo "ビュー" ;;
+    core) echo "コア" ;;
+    base) echo "ベース" ;;
+    dash) echo "ダッシュ" ;;
+    mini) echo "ミニ" ;;
+    mega) echo "メガ" ;;
+    next) echo "ネクスト" ;;
+    fire) echo "ファイア" ;;
+    cloud) echo "クラウド" ;;
+    spark) echo "スパーク" ;;
+    swift) echo "スウィフト" ;;
+    react) echo "リアクト" ;;
+    node) echo "ノード" ;;
     *) return 1 ;;
   esac
 }
@@ -490,9 +547,9 @@ voice_project_reading() {
   local project_name="$1"
   case "$project_name" in
     "ana") echo "エーエヌエー" ;;
-    "oc-general") echo "オーシージェネラル" ;;
-    "tproj") echo "ティープロジェイ" ;;
-    "tproj-ext") echo "ティープロジェイエクスト" ;;
+    "oc-general") echo "オープンクロー" ;;
+    "tproj") echo "ティープロジ" ;;
+    "aillio") echo "アイリオ" ;;
     "ailio") echo "アイリオ" ;;
     "clawgate") echo "クロウゲート" ;;
     "cc-status-bar") echo "シーシーステータスバー" ;;
@@ -501,6 +558,8 @@ voice_project_reading() {
     "statusline") echo "ステータスライン" ;;
     "chrome-ai-bridge") echo "クロームエーアイブリッジ" ;;
     "general") echo "ジェネラル" ;;
+    "music") echo "ミュージック" ;;
+    "openclaw") echo "オープンクロー" ;;
     *) voice_generic_project_reading "$project_name" ;;
   esac
 }
