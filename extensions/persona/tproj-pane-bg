@@ -1443,7 +1443,7 @@ if vertex_project:
     except Exception as exc:
         last_error = exc
 
-if response is None and (not vertex_project) and api_key:
+if response is None and api_key:
     try:
         client = genai.Client(api_key=api_key)
         response = generate_with_timeout(
