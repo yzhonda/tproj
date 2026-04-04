@@ -2114,7 +2114,9 @@ generate_background() {
   local lock_mtime=""
   local now_epoch=""
 
-  project="$(detect_project_root "$project_input")" || die "project path not found: $project_input"
+  # Trust the explicit --project path; do NOT resolve to git root
+  # (a non-git subdir inside a git repo would resolve to the wrong parent)
+  project="$(normalize_dir "$project_input")" || die "project path not found: $project_input"
   cache_dir="$(project_cache_dir "$project")"
   image_path="$(project_image_path "$project" "$role")"
   meta_path="$(project_meta_path "$project" "$role")"
