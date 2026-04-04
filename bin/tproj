@@ -1346,8 +1346,12 @@ parse_workspace_yaml() {
   # Fields: path \t type \t host \t alias \t enabled \t cc \t cdx
   local i proj_path proj_type proj_host proj_alias proj_enabled proj_cc proj_cdx
   while IFS=$'\t' read -r proj_path proj_type proj_host proj_alias proj_enabled proj_cc proj_cdx; do
+    # Restore placeholders to empty
+    [[ "$proj_path" == "_" ]] && proj_path=""
+    [[ "$proj_host" == "_" ]] && proj_host=""
+
     # Handle simple format (string items)
-    if [[ -z "$proj_type" ]]; then
+    if [[ "$proj_type" == "_" || -z "$proj_type" ]]; then
       proj_type="local"
       proj_host=""
       proj_alias="$(basename "$proj_path")"
@@ -1401,12 +1405,12 @@ parse_workspace_yaml() {
   done < <(echo "$WORKSPACE_JSON" | jq -r '
     .projects[] |
     if type == "string" then
-      . + "\t\t\t\t\t\t"
+      . + "\t_\t_\t_\t_\t_\t_"
     else
       [
-        (.path // ""),
+        (.path // "_"),
         (.type // "local"),
-        (.host // ""),
+        (.host // "_"),
         (.alias // (.path | split("/") | last)),
         (if .enabled == false then "false" else "true" end),
         (if .cc == false then "false" else "true" end),
