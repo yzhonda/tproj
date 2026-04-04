@@ -1007,123 +1007,116 @@ require_workspace_yq() {
   exit 1
 }
 
-read_workspace_string_setting() {
-  local query="$1"
-  local default_value="$2"
-  local label="$3"
-  local value_type
-  value_type=$(yq eval "$query | type" "$WORKSPACE_CONFIG" 2>/dev/null || echo "null")
+# --- Workspace JSON cache ---
+# Convert YAML to JSON once; all subsequent reads use jq on WORKSPACE_JSON.
+WORKSPACE_JSON=""
 
-  if [[ "$value_type" == "null" || "$value_type" == "!!null" ]]; then
-    printf '%s' "$default_value"
-    return 0
-  fi
-
-  if [[ "$value_type" != "!!str" ]]; then
-    echo "❌ Error: $label must be a string in $WORKSPACE_CONFIG" >&2
+load_workspace_json() {
+  [[ -n "$WORKSPACE_JSON" ]] && return 0
+  [[ -f "$WORKSPACE_CONFIG" ]] || return 1
+  require_workspace_yq
+  WORKSPACE_JSON="$(yq -o json "$WORKSPACE_CONFIG" 2>/dev/null)" || {
+    echo "Error: Failed to parse $WORKSPACE_CONFIG" >&2
     exit 1
-  fi
-
-  yq -r "$query" "$WORKSPACE_CONFIG" 2>/dev/null
+  }
 }
 
-read_workspace_bool_setting() {
-  local query="$1"
-  local default_value="$2"
-  local label="$3"
-  local value_type
-  value_type=$(yq eval "$query | type" "$WORKSPACE_CONFIG" 2>/dev/null || echo "null")
-
-  if [[ "$value_type" == "null" || "$value_type" == "!!null" ]]; then
-    printf '%s' "$default_value"
-    return 0
-  fi
-
-  if [[ "$value_type" != "!!bool" ]]; then
-    echo "❌ Error: $label must be a boolean in $WORKSPACE_CONFIG" >&2
-    exit 1
-  fi
-
-  yq -r "$query" "$WORKSPACE_CONFIG" 2>/dev/null
+# Read a string value from cached JSON. Returns default if null/missing.
+ws_string() {
+  local query="$1" default_value="$2"
+  local val
+  val="$(echo "$WORKSPACE_JSON" | jq -r "$query // empty" 2>/dev/null)" || true
+  printf '%s' "${val:-$default_value}"
 }
 
-load_workspace_string_array() {
-  local query="$1"
-  local label="$2"
-  local target_name="$3"
-  local array_type
-  local -a values
+# Read a bool value from cached JSON. Returns default if null/missing.
+ws_bool() {
+  local query="$1" default_value="$2"
+  local val
+  val="$(echo "$WORKSPACE_JSON" | jq -r "if $query == null then empty else $query end" 2>/dev/null)" || true
+  printf '%s' "${val:-$default_value}"
+}
 
-  array_type=$(yq eval "$query | type" "$WORKSPACE_CONFIG" 2>/dev/null || echo "null")
-  if [[ "$array_type" == "null" || "$array_type" == "!!null" ]]; then
-    eval "$target_name=()"
-    return 0
-  fi
-
-  if [[ "$array_type" != "!!seq" ]]; then
-    echo "❌ Error: $label must be an array of strings in $WORKSPACE_CONFIG" >&2
-    exit 1
-  fi
-
-  while IFS= read -r item_type; do
-    [[ -z "$item_type" ]] && continue
-    if [[ "$item_type" != "!!str" ]]; then
-      echo "❌ Error: $label must contain only strings in $WORKSPACE_CONFIG" >&2
-      exit 1
-    fi
-  done < <(yq -r "$query[] | type" "$WORKSPACE_CONFIG" 2>/dev/null || true)
-
-  values=()
-  while IFS= read -r item; do
-    values+=("$item")
-  done < <(yq -r "$query[]" "$WORKSPACE_CONFIG" 2>/dev/null || true)
-
+# Read a string array from cached JSON into a named array variable.
+ws_string_array() {
+  local query="$1" target_name="$2"
   eval "$target_name=()"
-  local value quoted_value
-  for value in "${values[@]}"; do
-    quoted_value="$(printf '%q' "$value")"
+  local val
+  val="$(echo "$WORKSPACE_JSON" | jq -r "($query // [])[]" 2>/dev/null)" || true
+  [[ -z "$val" ]] && return 0
+  local item quoted_value
+  while IFS= read -r item; do
+    quoted_value="$(printf '%q' "$item")"
     eval "$target_name+=($quoted_value)"
-  done
+  done <<< "$val"
 }
 
 parse_global_workspace_config() {
-  [[ -f "$WORKSPACE_CONFIG" ]] || return 0
-  require_workspace_yq
+  load_workspace_json || return 0
 
-  load_workspace_string_array '.launch.claude.args' 'launch.claude.args' GLOBAL_CLAUDE_ARGS
-  load_workspace_string_array '.launch.codex.args' 'launch.codex.args' GLOBAL_CODEX_ARGS
+  ws_string_array '.launch.claude.args' GLOBAL_CLAUDE_ARGS
+  ws_string_array '.launch.codex.args' GLOBAL_CODEX_ARGS
 
   # GUI app path from workspace.yaml (env var takes precedence)
   local yaml_app_path
-  yaml_app_path="$(read_workspace_string_setting '.gui.app_path' '' 'gui.app_path')"
+  yaml_app_path="$(ws_string '.gui.app_path' '')"
   if [[ -n "$yaml_app_path" && -z "${TPROJ_GUI_APP_PATH:-}" ]]; then
     TPROJ_GUI_APP_PATH="$yaml_app_path"
   fi
 
-  TMUX_UI_PANE_BORDER_ACTIVE_FG="$(read_workspace_string_setting '.tmux_ui.pane_border.active_fg' "$TMUX_UI_PANE_BORDER_ACTIVE_FG" 'tmux_ui.pane_border.active_fg')"
-  TMUX_UI_PANE_BORDER_ACTIVE_BOLD="$(read_workspace_bool_setting '.tmux_ui.pane_border.active_bold' "$TMUX_UI_PANE_BORDER_ACTIVE_BOLD" 'tmux_ui.pane_border.active_bold')"
-  TMUX_UI_PANE_BORDER_INACTIVE_FG="$(read_workspace_string_setting '.tmux_ui.pane_border.inactive_fg' "$TMUX_UI_PANE_BORDER_INACTIVE_FG" 'tmux_ui.pane_border.inactive_fg')"
-  TMUX_UI_PANE_BORDER_PREV1_FG="$(read_workspace_string_setting '.tmux_ui.pane_border.prev1_fg' "$TMUX_UI_PANE_BORDER_PREV1_FG" 'tmux_ui.pane_border.prev1_fg')"
-  TMUX_UI_PANE_BORDER_PREV2_FG="$(read_workspace_string_setting '.tmux_ui.pane_border.prev2_fg' "$TMUX_UI_PANE_BORDER_PREV2_FG" 'tmux_ui.pane_border.prev2_fg')"
-  TMUX_UI_PANE_BORDER_PREV3_FG="$(read_workspace_string_setting '.tmux_ui.pane_border.prev3_fg' "$TMUX_UI_PANE_BORDER_PREV3_FG" 'tmux_ui.pane_border.prev3_fg')"
+  # Batch-read all tmux_ui settings in a single jq call (TSV output)
+  local ui_line
+  ui_line="$(echo "$WORKSPACE_JSON" | jq -r '[
+    (.tmux_ui.pane_border.active_fg // ""),
+    (if .tmux_ui.pane_border.active_bold == null then "" else (.tmux_ui.pane_border.active_bold | tostring) end),
+    (.tmux_ui.pane_border.inactive_fg // ""),
+    (.tmux_ui.pane_border.prev1_fg // ""),
+    (.tmux_ui.pane_border.prev2_fg // ""),
+    (.tmux_ui.pane_border.prev3_fg // ""),
+    (.tmux_ui.pane_title.active_prefix // ""),
+    (.tmux_ui.pane_title.active_fg // ""),
+    (.tmux_ui.pane_title.active_bg // ""),
+    (.tmux_ui.pane_title.inactive_prefix // ""),
+    (.tmux_ui.pane_title.inactive_fg // ""),
+    (.tmux_ui.pane_title.inactive_bg // ""),
+    (.tmux_ui.pane_title.prev1_fg // ""),
+    (.tmux_ui.pane_title.prev1_bg // ""),
+    (.tmux_ui.pane_title.prev2_fg // ""),
+    (.tmux_ui.pane_title.prev2_bg // ""),
+    (.tmux_ui.pane_title.prev3_fg // ""),
+    (.tmux_ui.pane_title.prev3_bg // ""),
+    (.tmux_ui.window_text.active_fg // ""),
+    (.tmux_ui.window_text.active_bg // ""),
+    (.tmux_ui.window_text.inactive_fg // ""),
+    (.tmux_ui.window_text.inactive_bg // "")
+  ] | join("\t")' 2>/dev/null)" || true
 
-  TMUX_UI_PANE_TITLE_ACTIVE_PREFIX="$(read_workspace_string_setting '.tmux_ui.pane_title.active_prefix' "$TMUX_UI_PANE_TITLE_ACTIVE_PREFIX" 'tmux_ui.pane_title.active_prefix')"
-  TMUX_UI_PANE_TITLE_ACTIVE_FG="$(read_workspace_string_setting '.tmux_ui.pane_title.active_fg' "$TMUX_UI_PANE_TITLE_ACTIVE_FG" 'tmux_ui.pane_title.active_fg')"
-  TMUX_UI_PANE_TITLE_ACTIVE_BG="$(read_workspace_string_setting '.tmux_ui.pane_title.active_bg' "$TMUX_UI_PANE_TITLE_ACTIVE_BG" 'tmux_ui.pane_title.active_bg')"
-  TMUX_UI_PANE_TITLE_INACTIVE_PREFIX="$(read_workspace_string_setting '.tmux_ui.pane_title.inactive_prefix' "$TMUX_UI_PANE_TITLE_INACTIVE_PREFIX" 'tmux_ui.pane_title.inactive_prefix')"
-  TMUX_UI_PANE_TITLE_INACTIVE_FG="$(read_workspace_string_setting '.tmux_ui.pane_title.inactive_fg' "$TMUX_UI_PANE_TITLE_INACTIVE_FG" 'tmux_ui.pane_title.inactive_fg')"
-  TMUX_UI_PANE_TITLE_INACTIVE_BG="$(read_workspace_string_setting '.tmux_ui.pane_title.inactive_bg' "$TMUX_UI_PANE_TITLE_INACTIVE_BG" 'tmux_ui.pane_title.inactive_bg')"
-  TMUX_UI_PANE_TITLE_PREV1_FG="$(read_workspace_string_setting '.tmux_ui.pane_title.prev1_fg' "$TMUX_UI_PANE_TITLE_PREV1_FG" 'tmux_ui.pane_title.prev1_fg')"
-  TMUX_UI_PANE_TITLE_PREV1_BG="$(read_workspace_string_setting '.tmux_ui.pane_title.prev1_bg' "$TMUX_UI_PANE_TITLE_PREV1_BG" 'tmux_ui.pane_title.prev1_bg')"
-  TMUX_UI_PANE_TITLE_PREV2_FG="$(read_workspace_string_setting '.tmux_ui.pane_title.prev2_fg' "$TMUX_UI_PANE_TITLE_PREV2_FG" 'tmux_ui.pane_title.prev2_fg')"
-  TMUX_UI_PANE_TITLE_PREV2_BG="$(read_workspace_string_setting '.tmux_ui.pane_title.prev2_bg' "$TMUX_UI_PANE_TITLE_PREV2_BG" 'tmux_ui.pane_title.prev2_bg')"
-  TMUX_UI_PANE_TITLE_PREV3_FG="$(read_workspace_string_setting '.tmux_ui.pane_title.prev3_fg' "$TMUX_UI_PANE_TITLE_PREV3_FG" 'tmux_ui.pane_title.prev3_fg')"
-  TMUX_UI_PANE_TITLE_PREV3_BG="$(read_workspace_string_setting '.tmux_ui.pane_title.prev3_bg' "$TMUX_UI_PANE_TITLE_PREV3_BG" 'tmux_ui.pane_title.prev3_bg')"
-
-  TMUX_UI_WINDOW_TEXT_ACTIVE_FG="$(read_workspace_string_setting '.tmux_ui.window_text.active_fg' "$TMUX_UI_WINDOW_TEXT_ACTIVE_FG" 'tmux_ui.window_text.active_fg')"
-  TMUX_UI_WINDOW_TEXT_ACTIVE_BG="$(read_workspace_string_setting '.tmux_ui.window_text.active_bg' "$TMUX_UI_WINDOW_TEXT_ACTIVE_BG" 'tmux_ui.window_text.active_bg')"
-  TMUX_UI_WINDOW_TEXT_INACTIVE_FG="$(read_workspace_string_setting '.tmux_ui.window_text.inactive_fg' "$TMUX_UI_WINDOW_TEXT_INACTIVE_FG" 'tmux_ui.window_text.inactive_fg')"
-  TMUX_UI_WINDOW_TEXT_INACTIVE_BG="$(read_workspace_string_setting '.tmux_ui.window_text.inactive_bg' "$TMUX_UI_WINDOW_TEXT_INACTIVE_BG" 'tmux_ui.window_text.inactive_bg')"
+  if [[ -n "$ui_line" ]]; then
+    local -a ui_fields
+    IFS=$'\t' read -rA ui_fields <<< "$ui_line"
+    [[ -n "${ui_fields[0]:-}" ]] && TMUX_UI_PANE_BORDER_ACTIVE_FG="${ui_fields[0]}"
+    [[ -n "${ui_fields[1]:-}" ]] && TMUX_UI_PANE_BORDER_ACTIVE_BOLD="${ui_fields[1]}"
+    [[ -n "${ui_fields[2]:-}" ]] && TMUX_UI_PANE_BORDER_INACTIVE_FG="${ui_fields[2]}"
+    [[ -n "${ui_fields[3]:-}" ]] && TMUX_UI_PANE_BORDER_PREV1_FG="${ui_fields[3]}"
+    [[ -n "${ui_fields[4]:-}" ]] && TMUX_UI_PANE_BORDER_PREV2_FG="${ui_fields[4]}"
+    [[ -n "${ui_fields[5]:-}" ]] && TMUX_UI_PANE_BORDER_PREV3_FG="${ui_fields[5]}"
+    [[ -n "${ui_fields[6]:-}" ]] && TMUX_UI_PANE_TITLE_ACTIVE_PREFIX="${ui_fields[6]}"
+    [[ -n "${ui_fields[7]:-}" ]] && TMUX_UI_PANE_TITLE_ACTIVE_FG="${ui_fields[7]}"
+    [[ -n "${ui_fields[8]:-}" ]] && TMUX_UI_PANE_TITLE_ACTIVE_BG="${ui_fields[8]}"
+    [[ -n "${ui_fields[9]:-}" ]] && TMUX_UI_PANE_TITLE_INACTIVE_PREFIX="${ui_fields[9]}"
+    [[ -n "${ui_fields[10]:-}" ]] && TMUX_UI_PANE_TITLE_INACTIVE_FG="${ui_fields[10]}"
+    [[ -n "${ui_fields[11]:-}" ]] && TMUX_UI_PANE_TITLE_INACTIVE_BG="${ui_fields[11]}"
+    [[ -n "${ui_fields[12]:-}" ]] && TMUX_UI_PANE_TITLE_PREV1_FG="${ui_fields[12]}"
+    [[ -n "${ui_fields[13]:-}" ]] && TMUX_UI_PANE_TITLE_PREV1_BG="${ui_fields[13]}"
+    [[ -n "${ui_fields[14]:-}" ]] && TMUX_UI_PANE_TITLE_PREV2_FG="${ui_fields[14]}"
+    [[ -n "${ui_fields[15]:-}" ]] && TMUX_UI_PANE_TITLE_PREV2_BG="${ui_fields[15]}"
+    [[ -n "${ui_fields[16]:-}" ]] && TMUX_UI_PANE_TITLE_PREV3_FG="${ui_fields[16]}"
+    [[ -n "${ui_fields[17]:-}" ]] && TMUX_UI_PANE_TITLE_PREV3_BG="${ui_fields[17]}"
+    [[ -n "${ui_fields[18]:-}" ]] && TMUX_UI_WINDOW_TEXT_ACTIVE_FG="${ui_fields[18]}"
+    [[ -n "${ui_fields[19]:-}" ]] && TMUX_UI_WINDOW_TEXT_ACTIVE_BG="${ui_fields[19]}"
+    [[ -n "${ui_fields[20]:-}" ]] && TMUX_UI_WINDOW_TEXT_INACTIVE_FG="${ui_fields[20]}"
+    [[ -n "${ui_fields[21]:-}" ]] && TMUX_UI_WINDOW_TEXT_INACTIVE_BG="${ui_fields[21]}"
+  fi
 }
 
 render_tmux_pane_border_format() {
@@ -1336,72 +1329,31 @@ declare -a PROJECT_CC_LAUNCH
 declare -a PROJECT_CDX_LAUNCH
 
 parse_workspace_yaml() {
-  echo "📋 Workspace: $WORKSPACE_CONFIG" >&2
+  echo "tproj: loading workspace..." >&2
 
-  require_workspace_yq
-
-  # YAML 構文チェック
-  if ! yq eval '.projects[]' "$WORKSPACE_CONFIG" &>/dev/null; then
-    echo "" >&2
-    echo "❌ Error: Invalid YAML syntax in $WORKSPACE_CONFIG" >&2
-    echo "" >&2
-    echo "Options:" >&2
-    echo "  1. Fix the YAML syntax" >&2
-    echo "  2. Use single mode: tproj -s" >&2
-    echo "  3. Remove workspace.yaml to disable workspace mode" >&2
-    exit 1
-  fi
+  load_workspace_json
 
   local num_projects
-  num_projects=$(yq eval '.projects | length' "$WORKSPACE_CONFIG" 2>/dev/null || echo "0")
+  num_projects=$(echo "$WORKSPACE_JSON" | jq '.projects | length' 2>/dev/null || echo "0")
 
   if [[ "$num_projects" -eq 0 ]]; then
     echo "" >&2
-    echo "❌ Error: workspace.yaml exists but contains no projects" >&2
-    echo "" >&2
-    echo "Example workspace.yaml:" >&2
-    echo "  projects:" >&2
-    echo "    - path: /path/to/project1" >&2
-    echo "      type: local" >&2
-    echo "    - path: ~/projects/statusline" >&2
-    echo "      type: remote" >&2
-    echo "      host: macmini" >&2
+    echo "Error: workspace.yaml exists but contains no projects" >&2
     exit 1
   fi
 
-  # 簡易形式（文字列リスト）か詳細形式（オブジェクトリスト）か判定
-  local first_item_type
-  first_item_type=$(yq eval ".projects[0] | type" "$WORKSPACE_CONFIG" 2>/dev/null)
-
-  # NOTE: zsh では path/PATH が連動する特殊変数のため proj_path を使用
+  # Parse all projects in one jq call — outputs TSV lines
+  # Fields: path \t type \t host \t alias \t enabled \t cc \t cdx
   local i proj_path proj_type proj_host proj_alias proj_enabled proj_cc proj_cdx
-  for ((i=0; i<num_projects; i++)); do
-    if [[ "$first_item_type" == "!!str" ]]; then
-      # 簡易形式: 文字列リスト
-      proj_path=$(yq eval ".projects[$i]" "$WORKSPACE_CONFIG")
+  while IFS=$'\t' read -r proj_path proj_type proj_host proj_alias proj_enabled proj_cc proj_cdx; do
+    # Handle simple format (string items)
+    if [[ -z "$proj_type" ]]; then
       proj_type="local"
       proj_host=""
       proj_alias="$(basename "$proj_path")"
       proj_enabled="true"
       proj_cc="true"
       proj_cdx="true"
-    else
-      # 詳細形式: オブジェクトリスト
-      proj_path=$(yq eval ".projects[$i].path" "$WORKSPACE_CONFIG")
-      proj_type=$(yq eval ".projects[$i].type" "$WORKSPACE_CONFIG")
-      proj_host=$(yq eval ".projects[$i].host" "$WORKSPACE_CONFIG")
-      proj_alias=$(yq eval ".projects[$i].alias" "$WORKSPACE_CONFIG")
-      proj_enabled=$(yq eval ".projects[$i].enabled" "$WORKSPACE_CONFIG")
-      proj_cc=$(yq eval ".projects[$i].cc" "$WORKSPACE_CONFIG")
-      proj_cdx=$(yq eval ".projects[$i].cdx" "$WORKSPACE_CONFIG")
-
-      # デフォルト値
-      [[ "$proj_type" == "null" ]] && proj_type="local"
-      [[ "$proj_host" == "null" ]] && proj_host=""
-      [[ "$proj_alias" == "null" ]] && proj_alias="$(basename "$proj_path")"
-      [[ "$proj_enabled" == "null" ]] && proj_enabled="true"
-      [[ "$proj_cc" == "null" ]] && proj_cc="true"
-      [[ "$proj_cdx" == "null" ]] && proj_cdx="true"
     fi
 
     # パスを展開（~ や環境変数）
@@ -1442,13 +1394,26 @@ parse_workspace_yaml() {
     PROJECT_CDX_LAUNCH+=("$proj_cdx")
 
     if [[ "$proj_type" == "remote" ]]; then
-      echo "  ✅ [remote@$proj_host] $proj_path (alias: $proj_alias)" >&2
+      echo "  [remote@$proj_host] $proj_path (alias: $proj_alias)" >&2
     else
-      echo "  ✅ [local] $proj_path (alias: $proj_alias)" >&2
+      echo "  [local] $proj_path (alias: $proj_alias)" >&2
     fi
-  done
-
-  echo "" >&2
+  done < <(echo "$WORKSPACE_JSON" | jq -r '
+    .projects[] |
+    if type == "string" then
+      . + "\t\t\t\t\t\t"
+    else
+      [
+        (.path // ""),
+        (.type // "local"),
+        (.host // ""),
+        (.alias // (.path | split("/") | last)),
+        (if .enabled == false then "false" else "true" end),
+        (if .cc == false then "false" else "true" end),
+        (if .cdx == false then "false" else "true" end)
+      ] | join("\t")
+    end
+  ' 2>/dev/null)
 }
 
 if [[ -f "$WORKSPACE_CONFIG" ]]; then
