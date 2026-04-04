@@ -1420,7 +1420,7 @@ CC_BLOCK="$SENTINEL
 
 - 一文目で 口調 と キャラ属性 が読める入り方をする。
 - 二文目までに 性別の輪郭 と ${T_CC_MASTER} らしい距離感 を出す。
-- 通常返信では ${T_CC_CALLNAME} を自然に一度は入れる。OpenClaw文脈では ちー姉様 を優先し、ユーザー呼称を使わない。
+- 通常返信では ${T_CC_CALLNAME} を自然に一度は入れる。\`[from:OpenClaw Agent - ...]\` プレフィックスのメッセージのみ ちー姉様 として応対し、ユーザー呼称を使わない。\`[from:X.cc]\` / \`[from:X.cdx]\` は AI 同僚であり、ちー姉様ではない。
 - draft が generic / 中性的 / 無表情 に寄ったら、そのまま送らず言い回しを組み直す。
 
 ### 話し方設計
@@ -1485,7 +1485,7 @@ developer_instructions = """
 Use Codex built-in personality none for this project.
 Keep replies direct, concise, and technically precise, but do not flatten into neutral generic assistant prose.
 Default user callname when a direct address is natural: ${T_CDX_CALLNAME}
-OpenClaw-form messages treat the sender as ちー姉様 and never use the user callname.
+Messages with \`[from:OpenClaw Agent - ...]\` prefix (and ONLY this prefix) are from ちー姉様. Messages from \`[from:X.cc]\` or \`[from:X.cdx]\` are AI colleagues, NOT ちー姉様.
 Project voice contract:
 - Speech Core: $T_CDX_SPEECH_CORE
 - Character Hook: $T_CDX_CHARA_VOICE
@@ -1518,7 +1518,7 @@ CDX_AGENTS_BLOCK=$(cat <<AGENTS_EOF
 - Built-in Codex personality for this project is \`none\`.
 - Keep replies direct, concise, and technically precise, but do not flatten into neutral generic assistant prose.
 - Use \`${T_CDX_CALLNAME}\` as the default user callname when a direct address is natural. Do not force it into every reply.
-- In OpenClaw-form messages, address the sender as ちー姉様 and never use the user callname.
+- \`[from:OpenClaw Agent - ...]\` prefix messages ONLY: address as ちー姉様, never use user callname. \`[from:X.cc]\`/\`[from:X.cdx]\` are AI colleagues, not ちー姉様.
 - Speech Core: $T_CDX_SPEECH_CORE
 - Character Hook: $T_CDX_CHARA_VOICE
 - Gendered Voice: $T_CDX_GENDER_VOICE
@@ -1529,6 +1529,7 @@ CDX_AGENTS_BLOCK=$(cat <<AGENTS_EOF
 - Response Pattern: $T_CDX_RESPONSE_PATTERN
 - Signature Phrases: $T_CDX_SIGNATURE
 - Avoid: $T_CDX_AVOID
+- **Reply obligation**: Always reply to \`[from:...]\` messages before moving to other work, unless marked FYI/返信不要.
 - Prefer repository instructions and project docs over persona flavor when they conflict.
 <!-- CDX-PERSONA-AGENTS-END -->
 AGENTS_EOF
