@@ -568,6 +568,78 @@ run_after_layout_hook() {
   return 0
 }
 
+# --- Persona priming + hot-swap ---
+# Background: generate persona files, then hot-swap pane titles and trigger background image.
+# Does NOT block the startup flow.
+# Usage: prime_and_swap <session> <mode> <window> [args for run_after_layout_hook...]
+prime_and_swap() {
+  local session_name="$1"; shift
+  local after_layout_mode="$1"; shift
+  local after_layout_window="$1"; shift
+  # Remaining args: project_root, remote_host (for single mode)
+  local after_layout_root="${1:-}"
+  local after_layout_remote="${2:-}"
+
+  local persona_bin="${TPROJ_LABEL_HOOK:-}"
+  [[ -z "$persona_bin" ]] && persona_bin="$(runtime_bin_path "cc-persona" 2>/dev/null || true)"
+  [[ -z "$persona_bin" ]] && return 0
+
+  # Collect project paths + types + aliases from pane tags
+  local -a pane_entries
+  local pane_id role project alias
+  while IFS=$'\t' read -r pane_id role project alias; do
+    [[ -z "$role" || "$role" == "(null)" ]] && continue
+    # Single mode may not have @project set — fall back to after_layout_root
+    [[ -z "$project" || "$project" == "(null)" ]] && project="$after_layout_root"
+    [[ -z "$project" ]] && continue
+    pane_entries+=("${pane_id}|${role}|${project}|${alias}")
+  done < <(tmux list-panes -t "${session_name}:${after_layout_window}" \
+    -F '#{pane_id}\t#{@role}\t#{@project}\t#{@alias}' 2>/dev/null || true)
+
+  [[ ${#pane_entries[@]} -eq 0 ]] && return 0
+
+  # 1. Run cc-persona --prime for each unique project (parallel)
+  local -a primed_list prime_pids
+  local entry
+  for entry in "${pane_entries[@]}"; do
+    IFS='|' read -r pane_id role project alias <<< "$entry"
+    # Skip if already primed
+    local already=false
+    local p
+    for p in "${primed_list[@]}"; do
+      [[ "$p" == "$project" ]] && { already=true; break; }
+    done
+    $already && continue
+    primed_list+=("$project")
+    "$persona_bin" --prime "$project" >/dev/null 2>&1 &
+    prime_pids+=($!)
+  done
+
+  # Wait for all priming to complete
+  local pid
+  for pid in "${prime_pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+
+  # 2. Hot-swap pane titles with persona labels
+  for entry in "${pane_entries[@]}"; do
+    IFS='|' read -r pane_id role project alias <<< "$entry"
+    local tool_kind="CC"
+    case "$role" in
+      codex*) tool_kind="Codex" ;;
+    esac
+    local proj_type="local"
+    local proj_host=""
+    local new_title
+    new_title="$(build_pane_label "$proj_type" "$proj_host" "$project" "$tool_kind" "$alias")"
+    tmux select-pane -t "$pane_id" -T "$new_title" 2>/dev/null || true
+  done
+
+  # 3. Run after-layout hook (background images) — persona traits now available
+  run_after_layout_hook "$session_name" "$after_layout_mode" "$after_layout_window" \
+    "$after_layout_root" "$after_layout_remote"
+}
+
 # GUI アプリ終了（keep_alive=false の場合のみ）
 stop_tproj_gui_if_needed() {
   local keep_alive="true"  # デフォルト
@@ -1839,6 +1911,9 @@ start_workspace_tools() {
 
   # Start panes per column (staggered to avoid memory spike from concurrent npm updates)
   for ((i=1; i<=num_projects; i++)); do
+    local col_alias
+    col_alias="$(basename "${paths[$((i-1))]}" 2>/dev/null || echo "project")"
+    echo "tproj: starting ${col_alias} [$i/${num_projects}]..." >&2
     start_codex_for_column "$session" "$no_update" "$i" \
       "${paths[$((i-1))]}" "${types[$((i-1))]}" "${hosts[$((i-1))]}" "${cdx_launches[$((i-1))]:-true}"
     sleep 0.5
@@ -1876,6 +1951,7 @@ else
 fi
 
 # === 同名セッションがあれば再作成 ===
+echo "tproj: preparing session ${session}..." >&2
 if tmux has-session -t "$session" 2>/dev/null; then
   # Collect descendant PIDs before killing (MCP servers etc.)
   local_desc=$(collect_session_descendants "$session") || true
@@ -1892,16 +1968,20 @@ launch_tproj_gui
 # === セッション作成 & ツール起動 ===
 if [[ "$WORKSPACE_MODE" == "true" ]]; then
     # --- マルチプロジェクトモード ---
+    echo "tproj: creating workspace layout..." >&2
     create_workspace_layout "$session" "${PROJECT_PATHS[@]}" -- "${PROJECT_TYPES[@]}" -- "${PROJECT_HOSTS[@]}" -- "${PROJECT_ALIASES[@]}"
     prime_after_layout_manifest "$session"
-    run_after_layout_hook "$session" "workspace" "dev"
     start_workspace_tools "$session" "$NO_UPDATE" "${PROJECT_PATHS[@]}" -- "${PROJECT_TYPES[@]}" -- "${PROJECT_HOSTS[@]}" -- "${PROJECT_ALIASES[@]}" -- "${PROJECT_CC_LAUNCH[@]}" -- "${PROJECT_CDX_LAUNCH[@]}"
+
+    # Background: prime personas then hot-swap titles + trigger background images
+    prime_and_swap "$session" "workspace" "dev" &!
 
     tmux select-window -t "$session:dev"
   else
     # --- 単一プロジェクトモード ---
     # "プロジェクトのルート"を作業ディレクトリにする（gitならroot、無ければcwd）
     root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+    echo "tproj: starting session for $(basename "$root")..." >&2
 
     # 1) dev window を作成
     tmux new-session -d -s "$session" -c "$root" -n dev
@@ -1946,7 +2026,6 @@ if [[ "$WORKSPACE_MODE" == "true" ]]; then
     install_pane_focus_hook "$session"
 
     prime_after_layout_manifest "$session"
-    run_after_layout_hook "$session" "single" "dev" "$root" "$REMOTE_HOST"
 
     # 5) コマンドを自動起動（リモート/ローカルで分岐）
     if [[ -n "$REMOTE_HOST" ]]; then
@@ -1995,9 +2074,13 @@ if [[ "$WORKSPACE_MODE" == "true" ]]; then
 
     tmux select-window -t "$session:dev"
     tmux select-pane -t "$session:dev.1"
+
+    # Background: prime personas then hot-swap titles + trigger background images
+    prime_and_swap "$session" "single" "dev" "$root" "$REMOTE_HOST" &!
 fi
 
 # Pane auto-restart is handled by pane-died hook + tproj-respawn-guard (circuit breaker).
 # Legacy tproj-pane-watchdog is disabled (requires bash 4+ declare -A, macOS ships bash 3.2).
 
+echo "tproj: ready." >&2
 exec tmux attach -t "$session"

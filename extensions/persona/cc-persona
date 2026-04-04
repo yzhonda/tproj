@@ -1310,20 +1310,29 @@ if [[ "${1:-}" == "--label" ]]; then
   exit 0
 fi
 
-# --- Get cwd (hook mode: reads JSON from stdin) ---
-INPUT=""
-if ! [ -t 0 ]; then
-  INPUT=$(cat)
-fi
-
-CWD=""
-if [ -n "$INPUT" ]; then
-  if command -v jq >/dev/null 2>&1; then
-    CWD=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null)
+# --- --prime mode: standalone full generation (no stdin needed) ---
+# Usage: cc-persona --prime <project_path>
+# Generates MEMORY.md, .codex/config.toml, .voice.json for the given project.
+# Idempotent: safe to run before SessionStart (which will re-run as no-op).
+if [[ "${1:-}" == "--prime" ]]; then
+  CWD="${2:?Usage: cc-persona --prime <project_path>}"
+  # Fall through to full generation below
+else
+  # --- Get cwd (hook mode: reads JSON from stdin) ---
+  INPUT=""
+  if ! [ -t 0 ]; then
+    INPUT=$(cat)
   fi
-fi
-if [ -z "$CWD" ]; then
-  CWD=$(pwd)
+
+  CWD=""
+  if [ -n "$INPUT" ]; then
+    if command -v jq >/dev/null 2>&1; then
+      CWD=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null)
+    fi
+  fi
+  if [ -z "$CWD" ]; then
+    CWD=$(pwd)
+  fi
 fi
 
 # --- Compute MEMORY.md path ---
