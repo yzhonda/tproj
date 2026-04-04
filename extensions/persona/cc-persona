@@ -877,7 +877,7 @@ voice_volume_scale() {
 
 voice_tool_reading() {
   case "$1" in
-    cc|claude) echo "クロード" ;;
+    cc|claude) echo "シーシー" ;;
     cdx|codex) echo "コーデックス" ;;
     *) echo "" ;;
   esac
