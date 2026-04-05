@@ -444,6 +444,7 @@ voice_known_token_reading() {
     suno) echo "スノ" ;;
     manual) echo "マニュアル" ;;
     recall) echo "リコール" ;;
+    release) echo "リリース" ;;
     status) echo "ステータス" ;;
     bar) echo "バー" ;;
     line) echo "ライン" ;;
@@ -562,6 +563,7 @@ voice_project_reading() {
     "general") echo "ジェネラル" ;;
     "music") echo "ミュージック" ;;
     "sunomanual") echo "スノマニュアル" ;;
+    "release") echo "リリース" ;;
     "openclaw") echo "オープンクロー" ;;
     *) voice_generic_project_reading "$project_name" ;;
   esac
