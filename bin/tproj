@@ -611,7 +611,9 @@ prime_and_swap() {
     done
     $already && continue
     primed_list+=("$project")
-    "$persona_bin" --prime "$project" >/dev/null 2>&1 &
+    local -a prime_args=("$persona_bin" --prime "$project")
+    [[ -n "$alias" && "$alias" != "(null)" ]] && prime_args+=(--alias "$alias")
+    "${prime_args[@]}" >/dev/null 2>&1 &
     prime_pids+=($!)
   done
 

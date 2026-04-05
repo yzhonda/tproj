@@ -382,6 +382,18 @@ role_chara_trait() {
 }
 
 # --- Project-local VOICEVOX utterance templates (.cc-status-bar.voice.json) ---
+
+resolve_alias_from_workspace() {
+  local project_path="$1"
+  local ws_file="$HOME/.config/tproj/workspace.yaml"
+  [ -f "$ws_file" ] || { echo ""; return; }
+  awk -v target="$project_path" '
+    /^  - path:/ { p=$0; sub(/.*path: *\047?/,"",p); sub(/\047? *$/,"",p) }
+    /alias:/ { a=$0; sub(/.*alias: *\047?/,"",a); sub(/\047? *$/,"",a);
+               if (p==target) { print a; exit } }
+  ' "$ws_file"
+}
+
 voice_project_name() {
   basename "$1"
 }
@@ -574,12 +586,9 @@ voice_project_spoken() {
 }
 
 voice_project_alias_spoken() {
-  local project_name="$1"
-  case "$project_name" in
-    "cc-status-bar") echo "シーシーエスビー" ;;
-    "chrome-ai-bridge") echo "シーエービー" ;;
-    *) echo "" ;;
-  esac
+  local alias_name="$1"
+  [ -z "$alias_name" ] && { echo ""; return; }
+  voice_generic_project_reading "$alias_name"
 }
 
 voice_gender_meta() {
@@ -1375,13 +1384,20 @@ if [[ "${1:-}" == "--label" ]]; then
 fi
 
 # --- --prime mode: standalone full generation (no stdin needed) ---
-# Usage: cc-persona --prime <project_path>
+# Usage: cc-persona --prime <project_path> [--alias <name>]
 # Generates MEMORY.md, .codex/config.toml, .voice.json for the given project.
 # Idempotent: safe to run before SessionStart (which will re-run as no-op).
 if [[ "${1:-}" == "--prime" ]]; then
-  CWD="${2:?Usage: cc-persona --prime <project_path>}"
+  CWD="${2:?Usage: cc-persona --prime <project_path> [--alias <name>]}"
+  EXPLICIT_ALIAS=""
+  if [[ "${3:-}" == "--alias" ]]; then
+    EXPLICIT_ALIAS="${4:-}"
+  fi
   # Fall through to full generation below
 else
+  # hook mode — alias is resolved via workspace.yaml fallback (not tmux @alias,
+  # which only returns the active pane and is unreliable with multiple panes)
+  EXPLICIT_ALIAS=""
   # --- Get cwd (hook mode: reads JSON from stdin) ---
   INPUT=""
   if ! [ -t 0 ]; then
@@ -1623,7 +1639,12 @@ VOICE_FILE="$CWD/.cc-status-bar.voice.json"
 VOICE_PROJECT_NAME="$(voice_project_name "$CWD")"
 VOICE_PROJECT_READING="$(voice_project_reading "$VOICE_PROJECT_NAME")"
 VOICE_PROJECT_SPOKEN="$(voice_project_spoken "$VOICE_PROJECT_NAME")"
-VOICE_PROJECT_ALIAS_SPOKEN="$(voice_project_alias_spoken "$VOICE_PROJECT_NAME")"
+# Alias resolution: explicit --alias > workspace.yaml reverse lookup > empty (fallback)
+VOICE_ALIAS_NAME="${EXPLICIT_ALIAS:-$(resolve_alias_from_workspace "$CWD")}"
+VOICE_PROJECT_ALIAS_SPOKEN=""
+if [ -n "$VOICE_ALIAS_NAME" ] && [ "$VOICE_ALIAS_NAME" != "$VOICE_PROJECT_NAME" ]; then
+  VOICE_PROJECT_ALIAS_SPOKEN="$(voice_project_alias_spoken "$VOICE_ALIAS_NAME")"
+fi
 VOICE_CC_CALLNAME="$(voice_callname_spoken "$T_CC_CALLNAME")"
 VOICE_CDX_CALLNAME="$(voice_callname_spoken "$T_CDX_CALLNAME")"
 VOICE_CC_DEFAULTS_SPEAKER="$(voice_speaker_name cc "$T_CC_AGE" "$T_CC_TONE" "$T_CC_CHARA" "$T_CC_MASTER" "$T_CC_ERA")"
