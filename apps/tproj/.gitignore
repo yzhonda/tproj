@@ -1,2 +1,6 @@
+# >>> project-bootstrap managed >>>
+.cc-status-bar.voice.json
+# <<< project-bootstrap managed <<<
+
 .build/
 .local/release.md

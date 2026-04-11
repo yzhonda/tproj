@@ -581,6 +581,7 @@ prime_and_swap() {
   local after_layout_remote="${2:-}"
 
   local persona_bin="${TPROJ_LABEL_HOOK:-}"
+  [[ -z "$persona_bin" ]] && persona_bin="$(runtime_bin_path "project-bootstrap" 2>/dev/null || true)"
   [[ -z "$persona_bin" ]] && persona_bin="$(runtime_bin_path "cc-persona" 2>/dev/null || true)"
   [[ -z "$persona_bin" ]] && return 0
 
@@ -598,7 +599,7 @@ prime_and_swap() {
 
   [[ ${#pane_entries[@]} -eq 0 ]] && return 0
 
-  # 1. Run cc-persona --prime for each unique project (parallel)
+  # 1. Run project-bootstrap --prime for each unique project (parallel)
   local -a primed_list prime_pids
   local entry
   for entry in "${pane_entries[@]}"; do

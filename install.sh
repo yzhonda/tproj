@@ -380,19 +380,20 @@ if ! $CORE_ONLY; then
 
   # --- persona ---
   if [[ -d "$SCRIPT_DIR/extensions/persona" ]]; then
-    echo "  persona (cc-persona, tproj-pane-bg, voicevox-alert)"
+    echo "  persona (project-bootstrap, cc-persona compat, tproj-pane-bg, voicevox-alert)"
     if ! $DRY_RUN; then
-      rm -f ~/bin/cc-persona ~/bin/tproj-pane-bg ~/bin/voicevox-alert  # remove stale symlinks
+      rm -f ~/bin/project-bootstrap ~/bin/cc-persona ~/bin/tproj-pane-bg ~/bin/voicevox-alert  # remove stale symlinks
+      cp "$SCRIPT_DIR/extensions/persona/project-bootstrap" ~/bin/
       cp "$SCRIPT_DIR/extensions/persona/cc-persona" ~/bin/
       cp "$SCRIPT_DIR/extensions/persona/tproj-pane-bg" ~/bin/
       cp "$SCRIPT_DIR/extensions/persona/voicevox-alert" ~/bin/
-      chmod +x ~/bin/cc-persona ~/bin/tproj-pane-bg ~/bin/voicevox-alert
+      chmod +x ~/bin/project-bootstrap ~/bin/cc-persona ~/bin/tproj-pane-bg ~/bin/voicevox-alert
     else
-      echo "    [DRY-RUN] cc-persona, tproj-pane-bg, voicevox-alert -> ~/bin/"
+      echo "    [DRY-RUN] project-bootstrap, cc-persona, tproj-pane-bg, voicevox-alert -> ~/bin/"
     fi
     # Check optional deps
     if ! command -v jq &>/dev/null; then
-      echo "    ⚠️  jq not found (required by cc-persona): brew install jq"
+      echo "    ⚠️  jq not found (required by project-bootstrap): brew install jq"
     fi
     if ! python3 -c "import genai" 2>/dev/null; then
       echo "    ℹ️  google-genai not found (optional, for AI image generation): pip3 install google-genai"

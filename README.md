@@ -144,13 +144,13 @@ tproj supports hooks for customization:
 
 | Environment variable | Purpose | Example |
 |---------------------|---------|---------|
-| `TPROJ_LABEL_HOOK` | Custom pane label generator | `export TPROJ_LABEL_HOOK=cc-persona` |
+| `TPROJ_LABEL_HOOK` | Custom pane label generator | `export TPROJ_LABEL_HOOK=project-bootstrap` |
 | `TPROJ_GUI_APP_PATH` | Override GUI app location | `export TPROJ_GUI_APP_PATH=~/Apps/tproj.app` |
 | `TPROJ_AFTER_LAYOUT_HOOK` | Run after layout is set up | `export TPROJ_AFTER_LAYOUT_HOOK=tproj-pane-bg` |
 
 ### `TPROJ_LABEL_HOOK`
 
-When set, tproj calls `$TPROJ_LABEL_HOOK --label <project_path> <cc|cdx>` to generate a suffix for pane titles. This lets you add persona labels, status indicators, or any custom text to your pane titles.
+When set, tproj calls `$TPROJ_LABEL_HOOK --label <project_path> <cc|cdx>` to generate a suffix for pane titles. The primary tool is `project-bootstrap`; `cc-persona` remains as a compatibility alias. This lets you add persona labels, status indicators, or any custom text to your pane titles.
 
 ## Repository layout
 
@@ -170,7 +170,7 @@ config/                         # core configuration
 apps/tproj/                     # SwiftUI GUI app source
 extensions/                     # optional extensions
   messaging/                    #   tproj-msg + msg skill
-  persona/                      #   cc-persona + tproj-pane-bg
+  persona/                      #   project-bootstrap + cc-persona compat + tproj-pane-bg
   agent-teams/                  #   team-watcher, reflow-agent-pane, agent-monitor
   memory/                       #   cc-mem, memory-guard, tproj-mem-json
 ```
