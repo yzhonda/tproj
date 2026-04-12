@@ -387,7 +387,9 @@ final class PaneBackgroundUnderlayController: ObservableObject {
         let timer = DispatchSource.makeTimerSource(queue: .main)
         timer.schedule(deadline: .now(), repeating: .milliseconds(250))
         timer.setEventHandler { [weak self] in
-            self?.tick()
+            MainActor.assumeIsolated {
+                self?.tick()
+            }
         }
         timer.resume()
         pollTimer = timer
@@ -535,16 +537,18 @@ final class SnapResizeProxy: NSObject, NSWindowDelegate {
         let proposed = original?.windowWillResize?(sender, to: frameSize) ?? frameSize
         guard let tracker = tracker, tracker.isSnapped else { return proposed }
 
-        // Detect corner drag via mouse position
+        // When snapped, make corners ungrabbable (block diagonal resize entirely)
         let mouse = sender.mouseLocationOutsideOfEventStream
         let frame = sender.frame
-        let cornerSize: CGFloat = 20
-        let isCorner = (mouse.x < cornerSize || mouse.x > frame.width - cornerSize)
-                    && (mouse.y < cornerSize || mouse.y > frame.height - cornerSize)
+        let cornerSize: CGFloat = 80
+        let nearLeft   = mouse.x < cornerSize
+        let nearRight  = mouse.x > frame.width - cornerSize
+        let nearBottom = mouse.y < cornerSize
+        let nearTop    = mouse.y > frame.height - cornerSize
+        let isCorner = (nearLeft || nearRight) && (nearBottom || nearTop)
 
         if isCorner {
-            // Corner drag while snapped: lock width, allow height only
-            return NSSize(width: frame.width, height: proposed.height)
+            return frame.size
         }
         return proposed
     }
@@ -625,7 +629,9 @@ final class GhosttyWindowTracker: ObservableObject {
         let timer = DispatchSource.makeTimerSource(queue: .main)
         timer.schedule(deadline: .now(), repeating: .milliseconds(100))
         timer.setEventHandler { [weak self] in
-            self?.tick()
+            MainActor.assumeIsolated {
+                self?.tick()
+            }
         }
         timer.resume()
         pollTimer = timer
@@ -1954,7 +1960,7 @@ final class AppViewModel: ObservableObject {
             let snapshot = try JSONDecoder().decode(MonitorStatus.self, from: data)
             memoryStatus = snapshot
             memoryLastUpdatedAt = Date()
-            memoryErrorText = snapshot.collector.errors.isEmpty ? nil : snapshot.collector.errors[0]
+            memoryErrorText = snapshot.collector.errors.first
             persistMonitorStatus(snapshot)
 
             // Auto-kill: if available memory < 1GB, drop newest column to prevent kernel panic
@@ -3980,28 +3986,103 @@ private struct WorkspaceResizeDivider: View {
     }
 }
 
-// Visual hint at the window bottom edge indicating resize is available
+// Functional resize handle at the window bottom edge
 private struct WindowResizeGrip: View {
     @State private var isHovered = false
 
     var body: some View {
-        HStack(spacing: 3) {
-            ForEach(0..<3, id: \.self) { _ in
-                Circle()
-                    .fill(GhosttyTheme.current.foreground.opacity(isHovered ? 0.4 : 0.15))
-                    .frame(width: 4, height: 4)
+        ZStack {
+            BottomEdgeResizeHandle(isHovered: $isHovered)
+            HStack(spacing: 3) {
+                ForEach(0..<3, id: \.self) { _ in
+                    Circle()
+                        .fill(GhosttyTheme.current.foreground.opacity(isHovered ? 0.5 : 0.2))
+                        .frame(width: 4, height: 4)
+                }
             }
+            .allowsHitTesting(false)
+            .animation(.easeOut(duration: 0.14), value: isHovered)
         }
-        .frame(height: 12)
+        .frame(height: 20)
         .frame(maxWidth: .infinity)
-        .contentShape(Rectangle())
-        .onHover { hovering in
-            isHovered = hovering
-            if hovering { NSCursor.resizeUpDown.push() }
-            else { NSCursor.pop() }
-        }
-        .animation(.easeOut(duration: 0.14), value: isHovered)
     }
+}
+
+private struct BottomEdgeResizeHandle: NSViewRepresentable {
+    @Binding var isHovered: Bool
+
+    func makeNSView(context: Context) -> NSView {
+        let view = ResizeHandleView()
+        view.onHoverChange = { [weak view] hovering in
+            guard view != nil else { return }
+            DispatchQueue.main.async { isHovered = hovering }
+        }
+        return view
+    }
+    func updateNSView(_ nsView: NSView, context: Context) {}
+}
+
+private final class ResizeHandleView: NSView {
+    var onHoverChange: ((Bool) -> Void)?
+    private var initialFrame: NSRect = .zero
+    private var initialMouseY: CGFloat = 0
+    private var trackingArea: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let existing = trackingArea { removeTrackingArea(existing) }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .resizeUpDown)
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        onHoverChange?(true)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        onHoverChange?(false)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let window = window else { return }
+        initialFrame = window.frame
+        initialMouseY = NSEvent.mouseLocation.y
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let window = window else { return }
+        let currentY = NSEvent.mouseLocation.y
+        let deltaY = initialMouseY - currentY
+        let minHeight: CGFloat = 520
+        let newHeight = max(minHeight, initialFrame.height + deltaY)
+        let newY = initialFrame.maxY - newHeight
+        let newFrame = NSRect(
+            x: initialFrame.minX, y: newY,
+            width: initialFrame.width, height: newHeight
+        )
+        window.setFrame(newFrame, display: true)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard let window = window else { return }
+        NotificationCenter.default.post(
+            name: .tprojUserResizeFinished, object: window
+        )
+    }
+}
+
+extension Notification.Name {
+    static let tprojUserResizeFinished = Notification.Name("tprojUserResizeFinished")
 }
 
 struct ContentView: View {
@@ -4012,8 +4093,11 @@ struct ContentView: View {
     @StateObject private var underlayController = PaneBackgroundUnderlayController()
     @AppStorage("workspaceSectionHeight") private var workspaceHeight: Double = 480
     @AppStorage("monitorSectionHeight") private var monitorHeight: Double = -1
+    @AppStorage("windowWidth") private var persistedWidth: Double = 242
+    @AppStorage("windowHeight") private var persistedHeight: Double = 585
     @AppStorage("workspaceSectionCollapsed") private var workspaceCollapsed = false
-    @AppStorage("monitorSectionCollapsed") private var monitorCollapsed = false
+    @AppStorage("memorySectionCollapsed") private var memoryCollapsed = false
+    @AppStorage("ccCdxSectionCollapsed") private var ccCdxCollapsed = true
     @State private var draggingColumnID: Int?
     @State private var dropInsertionIndex: Int?
     @State private var isDragActive = false
@@ -4036,11 +4120,15 @@ struct ContentView: View {
             .background(GhosttyTheme.current.background.ignoresSafeArea())
             .background(
                 WindowAccessor { window in
-                    disableWindowFrameRestoration(window)
                     (NSApp.delegate as? AppDelegate)?.mainWindow = window
                     collapseController.attach(to: window)
                     underlayController.attach(to: window)
                     ghosttyTracker.attach(to: window)
+                    if !didRecoverWindowFrame {
+                        disableWindowFrameRestoration(window)
+                        observeWindowResize(window)
+                        didRecoverWindowFrame = true
+                    }
                 }
             )
         } else {
@@ -4142,14 +4230,18 @@ struct ContentView: View {
 
     @ViewBuilder
     private var upperRemainingSections: some View {
-        SectionHeader(title: "Memory")
-        Card(compact: true, chrome: false) {
-            memorySection()
+        SectionHeader(title: "Memory", isCollapsed: $memoryCollapsed)
+        if !memoryCollapsed {
+            Card(compact: true, chrome: false) {
+                memorySection()
+            }
         }
 
-        SectionHeader(title: "CC & Codex")
-        Card(compact: true, chrome: false) {
-            monitorSection()
+        SectionHeader(title: "CC & Codex", isCollapsed: $ccCdxCollapsed)
+        if !ccCdxCollapsed {
+            Card(compact: true, chrome: false) {
+                monitorSection()
+            }
         }
     }
 
@@ -4189,10 +4281,7 @@ struct ContentView: View {
                                 workspaceListContent
                             }
                         }
-                        SectionHeader(title: "Memory / CC & Codex", isCollapsed: $monitorCollapsed)
-                        if !monitorCollapsed {
-                            upperRemainingSections
-                        }
+                        upperRemainingSections
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 4)
@@ -4203,7 +4292,7 @@ struct ContentView: View {
             } else {
                 GeometryReader { geo in
                     let maxH = geo.size.height * 0.8
-                    VStack(spacing: 0) {
+                    VStack(alignment: .leading, spacing: 0) {
                         // -- Top: Current Workspace --
                         SectionHeader(title: "Current Workspace", isCollapsed: $workspaceCollapsed)
                             .padding(.horizontal, 4)
@@ -4226,19 +4315,14 @@ struct ContentView: View {
                         }
 
                         // -- Middle: Memory / CC & Codex (fills remaining space) --
-                        SectionHeader(title: "Memory / CC & Codex", isCollapsed: $monitorCollapsed)
-                            .padding(.horizontal, 4)
-
-                        if !monitorCollapsed {
-                            ScrollView {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    upperRemainingSections
-                                }
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.horizontal, 4)
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 4) {
+                                upperRemainingSections
                             }
-                            .frame(maxWidth: .infinity)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 4)
                         }
+                        .frame(maxWidth: .infinity)
                     }
                 }
                 .safeAreaInset(edge: .bottom, spacing: 0) { yamlFooter }
@@ -4278,7 +4362,6 @@ struct ContentView: View {
         }
         .background(
             WindowAccessor { window in
-                disableWindowFrameRestoration(window)
                 (NSApp.delegate as? AppDelegate)?.mainWindow = window
                 collapseController.attach(to: window)
                 windowLevelController.attach(to: window)
@@ -4288,11 +4371,16 @@ struct ContentView: View {
                     window.isOpaque = false
                 }
                 if !didRecoverWindowFrame {
+                    disableWindowFrameRestoration(window)
+                    observeWindowResize(window)
                     recoverWindowFrameIfNeeded(window)
                     window.makeKeyAndOrderFront(nil)
                     NSApp.activate(ignoringOtherApps: true)
                     didRecoverWindowFrame = true
                 }
+                // Disable window-move-by-background so it does not steal
+                // drag gestures from workspace column reordering.
+                window.isMovableByWindowBackground = false
                 ghosttyTracker.attach(to: window)
             }
         )
@@ -4325,6 +4413,34 @@ struct ContentView: View {
         // Prevent delayed scene/window restoration from overriding snap coordinates.
         _ = window.setFrameAutosaveName("")
         window.isRestorable = false
+        // Apply persisted size (origin is handled by snap logic)
+        let currentOrigin = window.frame.origin
+        let targetSize = NSSize(width: max(14, persistedWidth), height: max(520, persistedHeight))
+        window.setFrame(NSRect(origin: currentOrigin, size: targetSize), display: true)
+    }
+
+    private func persistWindowSize(_ window: NSWindow) {
+        persistedWidth = Double(window.frame.width)
+        persistedHeight = Double(window.frame.height)
+    }
+
+    private func observeWindowResize(_ window: NSWindow) {
+        // Only save when user actually finished dragging the resize edge
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didEndLiveResizeNotification,
+            object: window,
+            queue: .main
+        ) { [self] _ in
+            self.persistWindowSize(window)
+        }
+        // Custom bottom grip drag end
+        NotificationCenter.default.addObserver(
+            forName: .tprojUserResizeFinished,
+            object: window,
+            queue: .main
+        ) { [self] _ in
+            self.persistWindowSize(window)
+        }
     }
 
     private func recoverWindowFrameIfNeeded(_ window: NSWindow) {
@@ -5158,14 +5274,13 @@ struct TprojApp: App {
                 .frame(minWidth: 14, maxWidth: 550, minHeight: 520, idealHeight: 980, maxHeight: 2200)
         }
         .windowStyle(.hiddenTitleBar)
-        .defaultSize(width: 275, height: 980)
+        .defaultSize(width: 242, height: 585)
         .windowResizability(.contentMinSize)
 
         MenuBarExtra("tproj", systemImage: "rectangle.split.3x1") {
             FlipSideButton()
             Divider()
             Button("Quit tproj") { NSApp.terminate(nil) }
-                .keyboardShortcut("q")
         }
     }
 

@@ -991,6 +991,10 @@ add_workspace_column() {
 
   tmux select-pane -t "$new_claude"
   tmux select-window -t "$session:dev"
+
+  # Trigger pane-bg sync after tags are set (after-split-window fires too early)
+  run_after_layout_hook "$session" "workspace" "dev"
+
   release_layout_lock
   echo "✅ Added workspace column $new_col: $src_path" >&2
 }
