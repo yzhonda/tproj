@@ -2,7 +2,7 @@
 # tproj-pane-focus-hook - after-select-pane handler for pane focus history
 #
 # Manages prev1/prev2/prev3 pane ranking via @pane_rank.
-# Only updates rank for AUTO-FOCUS events (CCStatusBar AutofocusManager).
+# Only updates rank/time for AUTO-FOCUS events (CCStatusBar AutofocusManager).
 # Manual pane selections are ignored.
 #
 # Visual coloring is handled by pane-border-format (set in tproj) which reads
@@ -31,6 +31,9 @@ tmux set-environment -t "$session" -u TPROJ_AUTOFOCUS_PENDING 2>/dev/null || tru
 # Verify pending target matches new_active (resolve pane_id from pending target)
 pending_pane_id="$(tmux display-message -t "$pending" -p '#{pane_id}' 2>/dev/null || true)"
 [[ "$pending_pane_id" == "$new_active" ]] || exit 0
+
+# Auto-focus success -> stamp pane title time from the same event that updates rank.
+tmux set-option -pt "$new_active" @last_focus_at "$(date +%H:%M:%S)" 2>/dev/null || true
 
 # --- rank update (auto-focus only reaches here) ---
 prev1="$(tmux show-environment -t "$session" TPROJ_IDLE_PREV1 2>/dev/null | sed 's/^[^=]*=//' || true)"

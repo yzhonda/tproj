@@ -1266,9 +1266,9 @@ render_tmux_pane_border_format() {
     active_prefix_style="${active_prefix_style}#[bold]"
   fi
 
-  # Timestamp suffix: show @last_settled_at when a pane finishes a turn.
+  # Timestamp suffix: show @last_focus_at for auto-focus events.
   # Manual focus changes must not create or refresh this timestamp.
-  local ts_part="#{?#{@last_settled_at}, ${ts_style}#{@last_settled_at}#[default],}"
+  local ts_part="#{?#{@last_focus_at}, ${ts_style}#{@last_focus_at}#[default],}"
 
   # Active state
   local active_fmt="${active_prefix_style}${TMUX_UI_PANE_TITLE_ACTIVE_PREFIX}${active_text_style}#{pane_title}${ts_part}"
