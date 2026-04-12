@@ -441,6 +441,27 @@ if [[ "$PUBLISH" == "true" ]]; then
     --notes-file "$RELEASE_NOTES_FILE"
 
   echo -e "${GREEN}Published release: v${VERSION}${NC}"
+
+  # --- Update Homebrew tap ---
+  HOMEBREW_TAP_DIR="${HOMEBREW_TAP_DIR:-$(cd "$REPO_ROOT/../homebrew-tproj" 2>/dev/null && pwd || true)}"
+  HOMEBREW_CASK="$HOMEBREW_TAP_DIR/Casks/tproj.rb"
+  if [[ -f "$HOMEBREW_CASK" ]]; then
+    echo ""
+    echo -e "${GREEN}Updating Homebrew tap...${NC}"
+    sed -i '' "s/version \".*\"/version \"${VERSION}\"/" "$HOMEBREW_CASK"
+    sed -i '' "s/sha256 \".*\"/sha256 \"${DMG_SHA256}\"/" "$HOMEBREW_CASK"
+    (cd "$HOMEBREW_TAP_DIR" && git add Casks/tproj.rb && git commit -m "bump tproj to v${VERSION}" && git push) || {
+      echo -e "${YELLOW}Warning: homebrew tap update failed. Update manually:${NC}" >&2
+      echo "  cd $HOMEBREW_TAP_DIR" >&2
+      echo "  # update version and sha256 in Casks/tproj.rb" >&2
+    }
+    echo -e "${GREEN}Homebrew tap updated to v${VERSION}${NC}"
+  else
+    echo -e "${YELLOW}Homebrew tap not found at $HOMEBREW_TAP_DIR${NC}" >&2
+    echo "  Update Casks/tproj.rb manually with:" >&2
+    echo "    version \"${VERSION}\"" >&2
+    echo "    sha256 \"${DMG_SHA256}\"" >&2
+  fi
 else
   echo -e "${GREEN}Publish skipped${NC}"
   echo "To publish:"

@@ -12,40 +12,48 @@ Spin up a structured terminal layout with Claude Code, Codex, and yazi side by s
 - **Remote SSH** -- launch the same layout on a remote host
 - **Workspace config** -- YAML-driven project management with aliases and per-project settings
 
-## Requirements
-
-- **macOS** (CLI core works on any tmux-capable OS; GUI app and memory extension are macOS-only)
-- tmux, yazi, bat, yq, node/npm, git
+## Quick Start (Homebrew)
 
 ```bash
-brew install git tmux yazi bat yq node
+brew tap usedhonda/tproj
+brew install --cask tproj
+tproj init
+tproj
+```
+
+Uninstall:
+```bash
+brew uninstall --cask tproj
+brew untap usedhonda/tproj
+```
+
+## Requirements
+
+- **macOS** (CLI core works on any tmux-capable OS; GUI app is macOS-only)
+- [Claude Code](https://github.com/anthropics/claude-code) + [Codex](https://github.com/openai/codex)
+- tmux, yazi, bat, yq, jq, node/npm, git
+- Recommended terminal: [Ghostty](https://ghostty.org)
+
+```bash
+brew install git tmux yazi bat yq jq node
 npm install -g @anthropic-ai/claude-code @openai/codex
 ```
 
-## Install
+## Install (from source)
 
-The installer copies scripts to `~/bin/` and overwrites the following config files (existing files are backed up automatically):
-
-- `~/.tmux.conf`
-- `~/.config/yazi/` (yazi.toml, keymap.toml, package.toml)
-- Optionally appends a `PATH` entry to `~/.zshrc` or `~/.bashrc`
+If you prefer installing from source instead of Homebrew:
 
 ```bash
 git clone https://github.com/usedhonda/tproj.git
 cd tproj
 
-# Preview what will be changed (no modifications)
-./install.sh --dry-run
-
-# Full install: core + default extensions
-./install.sh
-
-# Minimal install: core scripts only, no config overwrites
-./install.sh --core-only
-
-# Everything including memory watchdog daemon
-./install.sh --all
+./install.sh           # core + default extensions
+./install.sh --dry-run  # preview only
+./install.sh --core-only  # minimal
+./install.sh --all      # everything including memory daemon
 ```
+
+After install, run `tproj init` to set up your workspace.
 
 Run `./install.sh -h` for all options.
 
