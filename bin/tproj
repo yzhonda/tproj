@@ -84,12 +84,13 @@ tproj - tmux project launcher
 
 Usage:
   tproj [OPTIONS]
+  tproj init           Interactive setup wizard (dependencies, workspace.yaml, hooks)
   tproj stop           Gracefully stop (Ctrl+C -> /exit -> wait -> kill)
   tproj kill           Immediately kill all tproj sessions (tmux kill-session)
 
 Options:
   --add [ALIAS]      Add workspace column (no arg: duplicate current, with alias: from workspace.yaml)
-  --check            Show workspace.yaml projects, aliases, and enabled status
+  --check            Health check: dependencies, config, hooks status
   --no-gui           Skip GUI auto-launch (used by the app bundle)
   --repair           Repair pane tags (@alias, @column, pane_title) from @role + @project
   --sync-ui          Reapply pane title format + hooks to live tproj sessions
@@ -180,6 +181,131 @@ TMUX_UI_WINDOW_TEXT_ACTIVE_FG="default"
 TMUX_UI_WINDOW_TEXT_ACTIVE_BG="terminal"
 TMUX_UI_WINDOW_TEXT_INACTIVE_FG="colour250"
 TMUX_UI_WINDOW_TEXT_INACTIVE_BG="terminal"
+
+# --- init subcommand ---
+if [[ "${1:-}" == "init" ]]; then
+  echo "tproj init - interactive setup wizard"
+  echo ""
+
+  # 1. Dependency check
+  echo "=== Checking dependencies ==="
+  MISSING_BREW=()
+  MISSING_INFO=()
+  for dep in tmux jq yq bat yazi; do
+    if command -v "$dep" >/dev/null 2>&1; then
+      printf "  %-16s %s\n" "$dep" "OK ($(command -v "$dep"))"
+    else
+      printf "  %-16s %s\n" "$dep" "MISSING"
+      MISSING_BREW+=("$dep")
+    fi
+  done
+  for dep in claude codex; do
+    if command -v "$dep" >/dev/null 2>&1; then
+      printf "  %-16s %s\n" "$dep" "OK"
+    else
+      printf "  %-16s %s\n" "$dep" "MISSING"
+      MISSING_INFO+=("$dep")
+    fi
+  done
+  echo ""
+
+  if [[ ${#MISSING_BREW[@]} -gt 0 ]]; then
+    echo "Install missing brew packages: ${MISSING_BREW[*]}"
+    printf "  brew install %s\n" "${MISSING_BREW[*]}"
+    printf "Run now? [Y/n] "
+    read -r answer
+    if [[ "${answer:-Y}" =~ ^[Yy]$ ]]; then
+      brew install "${MISSING_BREW[@]}"
+    fi
+    echo ""
+  fi
+
+  if [[ ${#MISSING_INFO[@]} -gt 0 ]]; then
+    echo "Missing AI tools (install manually):"
+    for dep in "${MISSING_INFO[@]}"; do
+      case "$dep" in
+        claude) echo "  npm install -g @anthropic-ai/claude-code" ;;
+        codex)  echo "  npm install -g @openai/codex" ;;
+      esac
+    done
+    echo ""
+  fi
+
+  # 2. workspace.yaml
+  WORKSPACE_DIR="$HOME/.config/tproj"
+  WS_FILE="$WORKSPACE_DIR/workspace.yaml"
+  echo "=== Workspace configuration ==="
+  if [[ -f "$WS_FILE" ]]; then
+    echo "  workspace.yaml already exists: $WS_FILE"
+  else
+    echo "  No workspace.yaml found."
+    printf "  Enter your first project path: "
+    read -r proj_path
+    if [[ -n "$proj_path" && -d "$proj_path" ]]; then
+      proj_name="$(basename "$proj_path")"
+      printf "  Alias (short name) [%s]: " "$proj_name"
+      read -r proj_alias
+      proj_alias="${proj_alias:-$proj_name}"
+
+      mkdir -p "$WORKSPACE_DIR"
+      cat > "$WS_FILE" <<WSEOF
+projects:
+  - path: '${proj_path}'
+    alias: '${proj_alias}'
+WSEOF
+      echo "  Created: $WS_FILE"
+    else
+      echo "  Skipped (invalid path or empty)."
+    fi
+  fi
+  echo ""
+
+  # 3. Claude Code hooks
+  echo "=== Claude Code hooks ==="
+  SETTINGS_FILE="$HOME/.claude/settings.json"
+  if [[ -f "$SETTINGS_FILE" ]]; then
+    if grep -q "project-bootstrap" "$SETTINGS_FILE" 2>/dev/null; then
+      echo "  SessionStart hook: already configured"
+    else
+      echo "  SessionStart hook: NOT configured"
+      echo "  This hook auto-generates persona for each project."
+      printf "  Add SessionStart hook? [Y/n] "
+      read -r answer
+      if [[ "${answer:-Y}" =~ ^[Yy]$ ]]; then
+        # Use jq to add hook to existing settings
+        if command -v jq >/dev/null 2>&1; then
+          NEW_HOOK='{"hooks":[{"type":"command","command":"$HOME/bin/project-bootstrap"}]}'
+          jq --argjson hook "$NEW_HOOK" '
+            .hooks.SessionStart = (.hooks.SessionStart // []) + [$hook]
+          ' "$SETTINGS_FILE" > "${SETTINGS_FILE}.tmp" && mv "${SETTINGS_FILE}.tmp" "$SETTINGS_FILE"
+          echo "  Added SessionStart hook."
+        else
+          echo "  jq not available, please add manually to $SETTINGS_FILE"
+        fi
+      fi
+    fi
+  else
+    echo "  $SETTINGS_FILE not found. Install Claude Code first."
+  fi
+  echo ""
+
+  # 4. PATH check
+  echo "=== PATH ==="
+  if echo "$PATH" | grep -q "$HOME/bin"; then
+    echo "  ~/bin is in PATH: OK"
+  else
+    echo "  ~/bin is NOT in PATH"
+    echo "  Add to your shell profile:"
+    echo '    export PATH="$HOME/bin:$PATH"'
+  fi
+  echo ""
+
+  echo "=== Setup complete ==="
+  echo "Next steps:"
+  echo "  tproj --check    # verify everything"
+  echo "  tproj            # launch workspace"
+  exit 0
+fi
 
 # stop/kill サブコマンド
 if [[ "${1:-}" == "stop" ]]; then
@@ -1524,45 +1650,109 @@ if [[ "$WORKSPACE_MODE" == "true" && -n "$REMOTE_HOST" ]]; then
 fi
 
 if [[ "$CHECK_MODE" == "true" ]]; then
-  if [[ ! -f "$WORKSPACE_CONFIG" ]]; then
-    echo "No workspace config found: $WORKSPACE_CONFIG" >&2
-    echo "" >&2
-    echo "Create one with:" >&2
-    echo "  mkdir -p ~/.config/tproj" >&2
-    echo "  cp config/workspace.yaml.example ~/.config/tproj/workspace.yaml" >&2
-    exit 1
-  fi
+  CHECK_OK=true
+  CHECK_WARN=false
 
-  echo "Catalog (all projects):" >&2
-  for ((i=0; i<${#CATALOG_ALIASES[@]}; i++)); do
-    local_type="${CATALOG_TYPES[$i]}"
-    local_host="${CATALOG_HOSTS[$i]}"
-    local_label="[local]"
-    [[ "$local_type" == "remote" ]] && local_label="[remote@$local_host]"
-
-    # enabled 判定: PROJECT_PATHS に含まれていれば active
-    is_active=false
-    for ((j=0; j<${#PROJECT_PATHS[@]}; j++)); do
-      if [[ "${PROJECT_PATHS[$j]}" == "${CATALOG_PATHS[$i]}" ]]; then
-        is_active=true
-        break
-      fi
-    done
-
-    if [[ "$is_active" == "true" ]]; then
-      printf "  %-20s  %-12s  %s  %s\n" "${CATALOG_ALIASES[$i]}" "$local_label" "${CATALOG_PATHS[$i]}" "" >&2
+  echo "=== Dependencies ===" >&2
+  for dep in tmux jq yq bat yazi; do
+    if command -v "$dep" >/dev/null 2>&1; then
+      ver="$("$dep" --version 2>&1 | head -1 | tr -d '\n' || true)"
+      printf "  %-16s %s\n" "$dep" "$ver" >&2
     else
-      printf "  %-20s  %-12s  %s  (disabled)\n" "${CATALOG_ALIASES[$i]}" "$local_label" "${CATALOG_PATHS[$i]}" >&2
+      printf "  %-16s %s\n" "$dep" "MISSING" >&2
+      CHECK_OK=false
+    fi
+  done
+  for dep in claude codex; do
+    if command -v "$dep" >/dev/null 2>&1; then
+      ver="$("$dep" --version 2>&1 | head -1 | tr -d '\n' || true)"
+      printf "  %-16s %s\n" "$dep" "$ver" >&2
+    else
+      printf "  %-16s %s\n" "$dep" "MISSING" >&2
+      CHECK_OK=false
     fi
   done
 
+  # Ghostty
+  if pgrep -q -i ghostty 2>/dev/null; then
+    printf "  %-16s %s\n" "Ghostty" "running" >&2
+  else
+    printf "  %-16s %s\n" "Ghostty" "not running (optional)" >&2
+    CHECK_WARN=true
+  fi
   echo "" >&2
-  echo "Active: ${#PROJECT_PATHS[@]} / Catalog: ${#CATALOG_ALIASES[@]}" >&2
-  print_global_workspace_config
 
-  if [[ ${#CATALOG_ALIASES[@]} -gt ${#PROJECT_PATHS[@]} ]]; then
+  echo "=== Configuration ===" >&2
+  # workspace.yaml
+  if [[ -f "$WORKSPACE_CONFIG" ]]; then
+    printf "  %-24s %s\n" "workspace.yaml" "OK" >&2
+  else
+    printf "  %-24s %s\n" "workspace.yaml" "MISSING" >&2
+    CHECK_OK=false
+  fi
+
+  # settings.json hooks
+  SETTINGS_FILE="$HOME/.claude/settings.json"
+  if [[ -f "$SETTINGS_FILE" ]] && grep -q "project-bootstrap" "$SETTINGS_FILE" 2>/dev/null; then
+    printf "  %-24s %s\n" "SessionStart hook" "OK" >&2
+  else
+    printf "  %-24s %s\n" "SessionStart hook" "NOT configured" >&2
+    CHECK_WARN=true
+  fi
+
+  # PATH
+  if echo "$PATH" | grep -q "$HOME/bin"; then
+    printf "  %-24s %s\n" "~/bin in PATH" "OK" >&2
+  else
+    printf "  %-24s %s\n" "~/bin in PATH" "MISSING" >&2
+    CHECK_OK=false
+  fi
+
+  # Optional: pane-bg
+  if command -v tproj-pane-bg >/dev/null 2>&1; then
+    printf "  %-24s %s\n" "tproj-pane-bg" "available" >&2
+  else
+    printf "  %-24s %s\n" "tproj-pane-bg" "not installed (optional)" >&2
+  fi
+  echo "" >&2
+
+  # Workspace catalog
+  if [[ -f "$WORKSPACE_CONFIG" ]]; then
+    echo "=== Workspace ===" >&2
+    for ((i=0; i<${#CATALOG_ALIASES[@]}; i++)); do
+      local_type="${CATALOG_TYPES[$i]}"
+      local_host="${CATALOG_HOSTS[$i]}"
+      local_label="[local]"
+      [[ "$local_type" == "remote" ]] && local_label="[remote@$local_host]"
+
+      is_active=false
+      for ((j=0; j<${#PROJECT_PATHS[@]}; j++)); do
+        if [[ "${PROJECT_PATHS[$j]}" == "${CATALOG_PATHS[$i]}" ]]; then
+          is_active=true
+          break
+        fi
+      done
+
+      if [[ "$is_active" == "true" ]]; then
+        printf "  %-20s  %-12s  %s\n" "${CATALOG_ALIASES[$i]}" "$local_label" "${CATALOG_PATHS[$i]}" >&2
+      else
+        printf "  %-20s  %-12s  %s  (disabled)\n" "${CATALOG_ALIASES[$i]}" "$local_label" "${CATALOG_PATHS[$i]}" >&2
+      fi
+    done
+
     echo "" >&2
-    echo "Tip: Add disabled projects with: tproj --add <alias>" >&2
+    echo "Active: ${#PROJECT_PATHS[@]} / Catalog: ${#CATALOG_ALIASES[@]}" >&2
+    print_global_workspace_config
+  fi
+
+  echo "" >&2
+  if [[ "$CHECK_OK" == "false" ]]; then
+    echo "Some checks failed. Run 'tproj init' to fix." >&2
+    exit 1
+  elif [[ "$CHECK_WARN" == "true" ]]; then
+    echo "All required checks passed (some optional items missing)." >&2
+  else
+    echo "All checks passed." >&2
   fi
   exit 0
 fi
