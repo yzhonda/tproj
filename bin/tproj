@@ -575,7 +575,20 @@ _find_gui_target() {
     [[ -x "$gui_bin" ]] && { echo "$gui_bin"; return 0; }
   done
 
-  # dist 版は自動起動しない。必要なら TPROJ_GUI_APP_PATH で明示指定
+  # (3) /Applications/tproj.app (Homebrew cask install)
+  local app_bin="/Applications/tproj.app/Contents/MacOS/tproj"
+  if [[ -x "$app_bin" ]]; then
+    echo "$app_bin"
+    return 0
+  fi
+
+  # (4) dist release bundle in tproj repo
+  for p in "${PROJECT_PATHS[@]}" "${CATALOG_PATHS[@]}" "$root"; do
+    gui_bin="$p/apps/tproj/dist/tproj.app/Contents/MacOS/tproj"
+    [[ -x "$gui_bin" ]] && { echo "$gui_bin"; return 0; }
+  done
+
+  echo "tproj: warning: GUI app not found (set TPROJ_GUI_APP_PATH or brew install --cask tproj)" >&2
   return 1
 }
 
@@ -587,7 +600,7 @@ _tproj_gui_kill_all() {
     rm -f "$TPROJ_GUI_PIDFILE"
   fi
   # パターンで残党掃討
-  pkill -f 'apps/tproj/dist/tproj.app/Contents/MacOS/tproj|\.build/.*/debug/tproj|tproj-gui' 2>/dev/null || true
+  pkill -f 'apps/tproj/dist/tproj.app/Contents/MacOS/tproj|\.build/.*/debug/tproj|/Applications/tproj.app/Contents/MacOS/tproj|tproj-gui' 2>/dev/null || true
   sleep 0.3
 }
 
@@ -596,7 +609,7 @@ launch_tproj_gui() {
   [[ "$NO_GUI" == "true" ]] && return 0
 
   local gui_path
-  gui_path="$(_find_gui_target 2>/dev/null)" || return 0
+  gui_path="$(_find_gui_target)" || return 0
   [[ -z "$gui_path" ]] && return 0
 
   # PID file あり && PID 生存 && 同じバイナリ → 既に正しいのが動いてる
