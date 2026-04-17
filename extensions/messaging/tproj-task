@@ -1,0 +1,70 @@
+#!/bin/bash
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+# shellcheck source=/dev/null
+source "$SELF_DIR/tproj-task-cache.sh"
+
+show_help() {
+  cat <<'EOF'
+tproj-task - inspect tracked tproj delegated tasks
+
+Usage:
+  tproj-task list
+  tproj-task status <id>
+  tproj-task close <id>
+  tproj-task gc
+  tproj-task --help
+EOF
+}
+
+find_task() {
+  local task_id="$1"
+  local target entry
+  while IFS= read -r target; do
+    [[ -n "$target" ]] || continue
+    if entry="$(tt_cache_get_task "$target" "$task_id" 2>/dev/null)"; then
+      printf '%s\t%s\n' "$target" "$entry"
+      return 0
+    fi
+  done < <(tt_cache_list_targets)
+  return 1
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  list)
+    tt_cache_list_all
+    ;;
+  status)
+    [[ $# -eq 2 ]] || { echo "Error: status requires <id>" >&2; exit 1; }
+    if ! result="$(find_task "$2")"; then
+      echo "Error: task '$2' not found" >&2
+      exit 1
+    fi
+    target="${result%%$'\t'*}"
+    entry="${result#*$'\t'}"
+    printf 'target=%s\n%s\n' "$target" "$entry"
+    ;;
+  close)
+    [[ $# -eq 2 ]] || { echo "Error: close requires <id>" >&2; exit 1; }
+    if ! result="$(find_task "$2")"; then
+      echo "Error: task '$2' not found" >&2
+      exit 1
+    fi
+    target="${result%%$'\t'*}"
+    tt_cache_remove_task "$target" "$2" >/dev/null
+    echo "closed $2 ($target)"
+    ;;
+  gc)
+    tt_cache_gc_expired
+    ;;
+  -h|--help|"")
+    show_help
+    ;;
+  *)
+    echo "Error: unknown subcommand '$cmd'" >&2
+    show_help >&2
+    exit 1
+    ;;
+esac

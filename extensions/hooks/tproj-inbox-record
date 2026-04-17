@@ -1,0 +1,43 @@
+#!/bin/bash
+set -euo pipefail
+
+[[ "${TPROJ_HOOK_ENABLED:-}" == "1" ]] || exit 0
+
+SELF_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+CACHE_HELPER="$SELF_DIR/tproj-task-cache.sh"
+if [[ ! -f "$CACHE_HELPER" ]]; then
+  CACHE_HELPER="$SELF_DIR/../messaging/tproj-task-cache.sh"
+fi
+[[ -f "$CACHE_HELPER" ]] || exit 0
+
+payload="$(cat)"
+tool_name="$(printf '%s' "$payload" | jq -r '(.tool_name // .hook_input.tool_name // "")' 2>/dev/null || printf '')"
+[[ "$tool_name" == "Bash" ]] || exit 0
+
+command_text="$(printf '%s' "$payload" | jq -r '(.tool_input.command // .tool_input.cmd // .command // "")' 2>/dev/null || printf '')"
+[[ "$command_text" == *tproj-msg* && "$command_text" == *--new-task* ]] || exit 0
+
+response_blob="$(printf '%s' "$payload" | jq -r '[
+  .tool_response.stderr,
+  .tool_response.stdout,
+  .tool_response.output,
+  .stderr,
+  .stdout,
+  .output,
+  .response
+] | map(select(. != null and . != "")) | join("\n")' 2>/dev/null || printf '')"
+
+meta_line="$(printf '%s\n' "$response_blob" | grep -E 'TASK_ID=.*TASK_TARGET=.*TASK_TTL_SEC=.*TASK_SENT_AT=' | tail -n 1 || true)"
+[[ -n "$meta_line" ]] || exit 0
+
+task_id="$(printf '%s\n' "$meta_line" | sed -nE 's/.*TASK_ID=([^[:space:]]+).*/\1/p')"
+task_target="$(printf '%s\n' "$meta_line" | sed -nE 's/.*TASK_TARGET=([^[:space:]]+).*/\1/p')"
+task_ttl_sec="$(printf '%s\n' "$meta_line" | sed -nE 's/.*TASK_TTL_SEC=([0-9]+).*/\1/p')"
+task_sent_at="$(printf '%s\n' "$meta_line" | sed -nE 's/.*TASK_SENT_AT=([0-9]+).*/\1/p')"
+
+[[ -n "$task_id" && -n "$task_target" && -n "$task_ttl_sec" && -n "$task_sent_at" ]] || exit 0
+
+# shellcheck source=/dev/null
+source "$CACHE_HELPER"
+tt_cache_add "$task_target" "$task_id" "$task_sent_at" "$task_ttl_sec" ""
+exit 0

@@ -1,0 +1,47 @@
+#!/bin/bash
+set -euo pipefail
+
+[[ "${TPROJ_HOOK_ENABLED:-}" == "1" ]] || exit 0
+
+CACHE_DIR="${TT_CACHE_DIR:-$HOME/.cache/tproj-expect-reply}"
+if ! link_count="$(stat -f '%l' "$CACHE_DIR" 2>/dev/null)"; then
+  exit 0
+fi
+
+[[ "${link_count:-0}" -gt 2 ]] || exit 0
+
+SELF_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+CACHE_HELPER="$SELF_DIR/tproj-task-cache.sh"
+MSG_CLI="$SELF_DIR/tproj-msg"
+if [[ ! -f "$CACHE_HELPER" ]]; then
+  CACHE_HELPER="$SELF_DIR/../messaging/tproj-task-cache.sh"
+fi
+if [[ ! -x "$MSG_CLI" ]]; then
+  MSG_CLI="$SELF_DIR/../messaging/tproj-msg"
+fi
+[[ -f "$CACHE_HELPER" && -x "$MSG_CLI" ]] || exit 0
+
+# shellcheck source=/dev/null
+source "$CACHE_HELPER"
+
+while IFS= read -r target; do
+  [[ -n "$target" ]] || continue
+  read_output="$("$MSG_CLI" --read "$target" 40 >/dev/null 2> >(cat) || true)"
+  while IFS=$'\t' read -r task_id _sent _until; do
+    [[ -n "$task_id" ]] || continue
+    if printf '%s\n' "$read_output" | grep -q "TASK_REPLIED=${task_id}"; then
+      echo "[inbox] ${target} task ${task_id} replied"
+    fi
+  done < <(tt_cache_list_tasks "$target")
+done < <(tt_cache_list_targets)
+
+while IFS=$'\t' read -r target task_id _sent expect_until; do
+  [[ -n "$target" && -n "$task_id" && -n "$expect_until" ]] || continue
+  now_epoch="$(date +%s)"
+  overdue_sec=$((now_epoch - expect_until))
+  overdue_min=$(( (overdue_sec + 59) / 60 ))
+  [[ "$overdue_min" -lt 0 ]] && overdue_min=0
+  echo "[inbox] ${target} task ${task_id} timeout (${overdue_min}m)"
+done < <(tt_cache_gc_expired)
+
+exit 0

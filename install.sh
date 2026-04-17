@@ -364,17 +364,34 @@ if ! $CORE_ONLY; then
 
   # --- messaging ---
   if [[ -d "$SCRIPT_DIR/extensions/messaging" ]]; then
-    echo "  messaging (tproj-msg)"
+    echo "  messaging (tproj-msg, tproj-task, tproj-task-cache)"
     if ! $DRY_RUN; then
       cp "$SCRIPT_DIR/extensions/messaging/tproj-msg" ~/bin/
+      cp "$SCRIPT_DIR/extensions/messaging/tproj-task" ~/bin/
+      cp "$SCRIPT_DIR/extensions/messaging/tproj-task-cache.sh" ~/bin/
       chmod +x ~/bin/tproj-msg
+      chmod +x ~/bin/tproj-task
+      chmod +x ~/bin/tproj-task-cache.sh
       # Install msg skill for Claude Code and Codex
       mkdir -p "$HOME/.claude/skills/msg" "$HOME/.codex/skills/msg"
       cp "$SCRIPT_DIR/extensions/messaging/skill-msg/SKILL.md" "$HOME/.claude/skills/msg/"
       cp "$SCRIPT_DIR/extensions/messaging/skill-msg/SKILL.md" "$HOME/.codex/skills/msg/"
     else
       echo "    [DRY-RUN] tproj-msg -> ~/bin/"
+      echo "    [DRY-RUN] tproj-task, tproj-task-cache.sh -> ~/bin/"
       echo "    [DRY-RUN] msg skill -> ~/.claude/skills/ + ~/.codex/skills/"
+    fi
+  fi
+
+  # --- hooks ---
+  if [[ -d "$SCRIPT_DIR/extensions/hooks" ]]; then
+    echo "  hooks (tproj-inbox-record, tproj-inbox-check)"
+    if ! $DRY_RUN; then
+      cp "$SCRIPT_DIR/extensions/hooks/tproj-inbox-record" ~/bin/
+      cp "$SCRIPT_DIR/extensions/hooks/tproj-inbox-check" ~/bin/
+      chmod +x ~/bin/tproj-inbox-record ~/bin/tproj-inbox-check
+    else
+      echo "    [DRY-RUN] tproj-inbox-record, tproj-inbox-check -> ~/bin/"
     fi
   fi
 

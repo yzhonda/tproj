@@ -13,6 +13,8 @@ set -euo pipefail
 #   tproj-msg --force <target> <message> Send immediately (no idle check, no auto-flush)
 #   tproj-msg --allow-relay <reason> ... One-time override for relay-like send
 #   tproj-msg --allow-fanout <reason> .. One-time override for multi-target fan-out
+#   tproj-msg --new-task [--ttl <spec>] <target> <message>
+#                                      Send message with Task ID tracking metadata
 #   tproj-msg --list                     List available targets
 #   tproj-msg --read <target> [lines]    Read target's recent output
 #   tproj-msg --status [target]          Show target idle/busy state + queue info
@@ -57,6 +59,8 @@ Usage:
   tproj-msg --force <target> <message> Send immediately (no idle check, no auto-flush)
   tproj-msg --allow-relay <reason> ... One-time override for relay-like send
   tproj-msg --allow-fanout <reason> .. One-time override for multi-target fan-out
+  tproj-msg --new-task [--ttl <spec>] <target> <message>
+                                       Send message with Task ID tracking metadata
   tproj-msg --list                     List available targets
   tproj-msg --read <target> [lines]    Read target's recent output
   tproj-msg --status [target]          Show idle/busy state + queue info
@@ -83,6 +87,7 @@ Examples:
   tproj-msg --force cdx "urgent message"
   tproj-msg --allow-relay incident-123 --force tproj.cc "[Control:PSYNC-STOP] ACK"
   tproj-msg --allow-fanout sync-1 tproj.cc "Please review this design"
+  tproj-msg --new-task --ttl 45m tproj.cc "Please take Lane D"
   tproj-msg gate "Send via session-first tmux lane"
   tproj-msg gate:session "Send via session tmux lane (explicit)"
   tproj-msg gate:line "Send via LINE adapter"
@@ -124,6 +129,7 @@ SELF_PATH=$(canonicalize_path "$0" 2>/dev/null || printf '%s' "$0")
 HOME_BIN_PATH="$HOME/bin/tproj-msg"
 HOME_BIN_PATH=$(canonicalize_path "$HOME_BIN_PATH" 2>/dev/null || printf '%s' "$HOME_BIN_PATH")
 REPO_BIN_CANDIDATE=$(find_repo_tproj_msg_from_cwd 2>/dev/null || true)
+TASK_CACHE_HELPER="$(dirname "$SELF_PATH")/tproj-task-cache.sh"
 
 if [[ -z "${TPROJ_MSG_REEXECED:-}" ]] && [[ "$SELF_PATH" == "$HOME_BIN_PATH" ]] && [[ -n "${REPO_BIN_CANDIDATE:-}" ]] && [[ "$REPO_BIN_CANDIDATE" != "$SELF_PATH" ]]; then
   echo "Info: stale tproj-msg detected at ~/bin; re-exec -> $REPO_BIN_CANDIDATE" >&2
@@ -188,6 +194,8 @@ READ_MODE=false
 FLUSH_MODE=false
 STATUS_MODE=false
 VERSION_MODE=false
+NEW_TASK_MODE=false
+TTL_SPEC=""
 ALLOW_RELAY=false
 ALLOW_RELAY_REASON=""
 ALLOW_FANOUT=false
@@ -227,6 +235,16 @@ while [[ $# -gt 0 ]]; do
       [[ $# -lt 1 ]] && { echo "Error: --allow-fanout requires <reason>" >&2; exit 1; }
       ALLOW_FANOUT=true
       ALLOW_FANOUT_REASON="$1"
+      shift
+      ;;
+    --new-task)
+      NEW_TASK_MODE=true
+      shift
+      ;;
+    --ttl)
+      shift
+      [[ $# -lt 1 ]] && { echo "Error: --ttl requires <spec>" >&2; exit 1; }
+      TTL_SPEC="$1"
       shift
       ;;
     --fire)
@@ -303,6 +321,33 @@ if [[ $MODE_COUNT -gt 1 ]]; then
   exit 1
 fi
 
+SEND_MODE=true
+if [[ "$LIST_MODE" == "true" || "$READ_MODE" == "true" || "$FLUSH_MODE" == "true" || "$STATUS_MODE" == "true" || "$VERSION_MODE" == "true" ]]; then
+  SEND_MODE=false
+fi
+
+if [[ "$NEW_TASK_MODE" == "true" && "$SEND_MODE" != "true" ]]; then
+  echo "Error: --new-task is only valid for send modes" >&2
+  exit 1
+fi
+
+if [[ -n "$TTL_SPEC" && "$NEW_TASK_MODE" != "true" ]]; then
+  echo "Error: --ttl requires --new-task" >&2
+  exit 1
+fi
+
+TTL_SPEC="${TTL_SPEC:-30m}"
+
+if [[ "$NEW_TASK_MODE" == "true" ]]; then
+  [[ -f "$TASK_CACHE_HELPER" ]] || { echo "Error: missing task cache helper: $TASK_CACHE_HELPER" >&2; exit 1; }
+  # shellcheck source=/dev/null
+  source "$TASK_CACHE_HELPER"
+  if ! TTL_SEC=$(tt_cache_ttl_to_seconds "$TTL_SPEC"); then
+    echo "Error: invalid TTL spec '$TTL_SPEC'" >&2
+    exit 1
+  fi
+fi
+
 if [[ "$VERSION_MODE" == "true" ]]; then
   [[ ${#POSITIONAL_ARGS[@]} -eq 0 ]] || { echo "Error: --version takes no positional arguments" >&2; exit 1; }
   show_version
@@ -377,6 +422,14 @@ if [[ -n "$EXPLICIT_SESSION" ]]; then
       MY_ROLE=$(role_to_short "$MY_ROLE_RAW")
     fi
   else
+    if [[ "$SEND_MODE" != "true" ]]; then
+      MY_ALIAS=""
+      MY_ROLE=""
+      MY_ROLE_RAW=""
+      MY_COLUMN=""
+      # Non-send modes do not need sender identity.
+      :
+    else
     # --as omitted: auto-detect sender from CWD + parent process
     auto_alias=""
     auto_role=""
@@ -406,6 +459,7 @@ if [[ -n "$EXPLICIT_SESSION" ]]; then
       echo "  CWD alias: ${auto_alias:-<not found>}, parent role: ${auto_role:-<not found>}" >&2
       echo "  Use --as <alias.role> to specify sender identity." >&2
       exit 1
+    fi
     fi
   fi
   MY_COLUMN=""
@@ -1986,8 +2040,24 @@ fi
 
 # === --read mode ===
 if [[ "$READ_MODE" == "true" ]]; then
-  tmux capture-pane -t "$TARGET_PANE" -p -S "-${READ_LINES}"
-  exit 0
+  CAPTURED_OUTPUT="$(tmux capture-pane -t "$TARGET_PANE" -p -S "-${READ_LINES}")"
+  printf '%s\n' "$CAPTURED_OUTPUT"
+
+  if [[ ! -f "$TASK_CACHE_HELPER" ]]; then
+    exit 0
+  fi
+
+  # shellcheck source=/dev/null
+  source "$TASK_CACHE_HELPER"
+  FOUND_REPLY=1
+  while IFS= read -r reply_id; do
+    [[ -n "$reply_id" ]] || continue
+    tt_cache_remove_task "$TARGET" "$reply_id" >/dev/null 2>&1 || true
+    echo "TASK_REPLIED=${reply_id}" >&2
+    FOUND_REPLY=0
+  done < <(printf '%s\n' "$CAPTURED_OUTPUT" | grep -Eo '\[(ACK|DONE|BLOCK|BLOCKED):[[:space:]]*[^]]+\]' | sed -E 's/^\[(ACK|DONE|BLOCK|BLOCKED):[[:space:]]*//; s/\]$//' | awk 'NF {print $0}')
+
+  exit "$FOUND_REPLY"
 fi
 
 # For send modes, refuse to send if pane exists but AI is not running.
@@ -2044,6 +2114,30 @@ else
   HEADER="[from:${MY_ROLE}]"
 fi
 
+generate_task_id() {
+  local alias_part epoch_min seq_root epoch_root seq=0 next=0 seq_dir
+  alias_part=$(printf '%s' "${MY_ALIAS:-}" | tr -cd '[:alnum:]-')
+  [[ -n "$alias_part" ]] || alias_part="tp"
+  epoch_min=$(( $(date +%s) / 60 ))
+  seq_root="/tmp/tproj-task-seq/${TARGET}"
+  epoch_root="${seq_root}/${epoch_min}"
+  mkdir -p "$epoch_root"
+  while [[ $seq -lt 100 ]]; do
+    next=$((seq + 1))
+    seq_dir=$(printf '%s/%02d' "$epoch_root" "$next")
+    if mkdir "$seq_dir" 2>/dev/null; then
+      printf '%s-%s-%02d\n' "$alias_part" "$epoch_min" "$next"
+      return 0
+    fi
+    seq=$next
+  done
+  echo "Error: failed to allocate task id sequence for $TARGET" >&2
+  exit 1
+}
+
+TASK_ID=""
+TASK_SENT_AT=""
+
 # === Send helpers ===
 
 # Raw send: push text into target pane via tmux send-keys
@@ -2052,7 +2146,16 @@ raw_send() {
   sleep 0.5
   tmux send-keys -t "$TARGET_PANE" Enter
   echo "Sent to $TARGET: ${HEADER} ${MESSAGE}" >&2
+  if [[ "$NEW_TASK_MODE" == "true" ]]; then
+    TASK_SENT_AT=$(date +%s)
+    echo "TASK_ID=${TASK_ID} TASK_TARGET=${TARGET} TASK_TTL_SEC=${TTL_SEC} TASK_SENT_AT=${TASK_SENT_AT}" >&2
+  fi
 }
+
+if [[ "$NEW_TASK_MODE" == "true" ]]; then
+  TASK_ID=$(generate_task_id)
+  MESSAGE="[Task: ${TASK_ID}] ${MESSAGE}"
+fi
 
 # === --force: no idle check, no auto-flush, pure immediate send ===
 if [[ "$FORCE_MODE" == "true" ]]; then
