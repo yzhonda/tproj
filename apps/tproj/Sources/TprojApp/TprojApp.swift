@@ -240,6 +240,27 @@ private struct PaneBackgroundGrid: Decodable, Equatable {
     }
 }
 
+private struct PaneBackgroundPadding: Decodable, Equatable {
+    var x: Double
+    var y: Double
+
+    enum CodingKeys: String, CodingKey {
+        case x
+        case y
+    }
+
+    init(x: Double = 0, y: Double = 0) {
+        self.x = x
+        self.y = y
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        x = try c.decodeIfPresent(Double.self, forKey: .x) ?? 0
+        y = try c.decodeIfPresent(Double.self, forKey: .y) ?? 0
+    }
+}
+
 private struct PaneBackgroundPane: Identifiable, Decodable, Equatable {
     var paneID: String
     var role: String
@@ -280,12 +301,16 @@ private struct PaneBackgroundManifest: Decodable, Equatable {
     var session: String
     var window: String
     var windowCells: PaneBackgroundGrid
+    var clientCells: PaneBackgroundGrid?
+    var windowPaddingPx: PaneBackgroundPadding?
     var panes: [PaneBackgroundPane]
 
     enum CodingKeys: String, CodingKey {
         case session
         case window
         case windowCells = "window_cells"
+        case clientCells = "client_cells"
+        case windowPaddingPx = "window_padding_px"
         case panes
     }
 
@@ -293,11 +318,15 @@ private struct PaneBackgroundManifest: Decodable, Equatable {
         session: String = "",
         window: String = "",
         windowCells: PaneBackgroundGrid = PaneBackgroundGrid(),
+        clientCells: PaneBackgroundGrid? = nil,
+        windowPaddingPx: PaneBackgroundPadding? = nil,
         panes: [PaneBackgroundPane] = []
     ) {
         self.session = session
         self.window = window
         self.windowCells = windowCells
+        self.clientCells = clientCells
+        self.windowPaddingPx = windowPaddingPx
         self.panes = panes
     }
 
@@ -306,6 +335,8 @@ private struct PaneBackgroundManifest: Decodable, Equatable {
         session = try c.decodeIfPresent(String.self, forKey: .session) ?? ""
         window = try c.decodeIfPresent(String.self, forKey: .window) ?? ""
         windowCells = try c.decodeIfPresent(PaneBackgroundGrid.self, forKey: .windowCells) ?? PaneBackgroundGrid()
+        clientCells = try c.decodeIfPresent(PaneBackgroundGrid.self, forKey: .clientCells)
+        windowPaddingPx = try c.decodeIfPresent(PaneBackgroundPadding.self, forKey: .windowPaddingPx)
         panes = try c.decodeIfPresent([PaneBackgroundPane].self, forKey: .panes) ?? []
     }
 }
@@ -316,6 +347,24 @@ private struct PaneBackgroundUnderlayView: View {
     private let imageSaturation = 1.04
     private let imageContrast = 0.95
     private let textReadabilityScrim = 0.07
+    private let edgeFadePx: CGFloat = 3
+
+    private var edgeFadeMask: some View {
+        VStack(spacing: 0) {
+            LinearGradient(
+                gradient: Gradient(colors: [.clear, .black]),
+                startPoint: .top, endPoint: .bottom
+            )
+            .frame(height: edgeFadePx)
+            Color.black
+                .frame(maxHeight: .infinity)
+            LinearGradient(
+                gradient: Gradient(colors: [.black, .clear]),
+                startPoint: .top, endPoint: .bottom
+            )
+            .frame(height: edgeFadePx)
+        }
+    }
 
     var body: some View {
         GeometryReader { geo in
@@ -335,6 +384,7 @@ private struct PaneBackgroundUnderlayView: View {
                             .overlay {
                                 Color.black.opacity(textReadabilityScrim)
                             }
+                            .mask(edgeFadeMask)
                             .opacity(pane.opacity)
                             .position(x: rect.midX, y: rect.midY)
                     }
@@ -344,13 +394,38 @@ private struct PaneBackgroundUnderlayView: View {
         .background(Color.clear)
     }
 
+    // macOS native titlebar 相当の chrome 高さ。動的に計算（hardcode 値に賭けない）。
+    // Ghostty は `.titled + fullSizeContentView` で contentView 全体に描画するが、terminal grid は
+    // titlebar 領域の下から開始する。underlay window は `.borderless` で contentView == frame 全体
+    // なので、画像配置を titlebar 分だけ下にオフセットする必要がある。
+    private static let titlebarChromeHeight: CGFloat = {
+        let contentRect = CGRect(x: 0, y: 0, width: 100, height: 100)
+        let frameRect = NSWindow.frameRect(forContentRect: contentRect, styleMask: [.titled])
+        return frameRect.height - contentRect.height
+    }()
+
     private func paneRect(for pane: PaneBackgroundPane, in size: CGSize) -> CGRect {
-        let cols = max(CGFloat(manifest.windowCells.width), 1)
-        let rows = max(CGFloat(manifest.windowCells.height), 1)
-        let x = CGFloat(pane.left) / cols * size.width
-        let y = CGFloat(pane.top) / rows * size.height
-        let width = CGFloat(max(pane.width, 1)) / cols * size.width
-        let height = CGFloat(max(pane.height, 1)) / rows * size.height
+        // pane area 正規化: ペイン占有領域 (topMost..bottomMost / leftMost..rightMost) を
+        // underlay contentView 全体から Ghostty chrome (titlebar) を引いた領域に引き伸ばす。
+        let fallbackCols = manifest.clientCells?.width ?? manifest.windowCells.width
+        let fallbackRows = manifest.clientCells?.height ?? manifest.windowCells.height
+        let leftMost = CGFloat(manifest.panes.map { $0.left }.min() ?? 0)
+        let topMost = CGFloat(manifest.panes.map { $0.top }.min() ?? 0)
+        let rightMost = CGFloat(manifest.panes.map { $0.left + $0.width }.max() ?? fallbackCols)
+        let bottomMost = CGFloat(manifest.panes.map { $0.top + $0.height }.max() ?? fallbackRows)
+        let paneAreaCols = max(rightMost - leftMost, 1)
+        let paneAreaRows = max(bottomMost - topMost, 1)
+
+        let padX = CGFloat(manifest.windowPaddingPx?.x ?? 0)
+        let padY = CGFloat(manifest.windowPaddingPx?.y ?? 0)
+        let chromeTop = Self.titlebarChromeHeight
+        let innerW = max(size.width - 2 * padX, 1)
+        let innerH = max(size.height - chromeTop - 2 * padY, 1)
+
+        let x = padX + (CGFloat(pane.left) - leftMost) / paneAreaCols * innerW
+        let y = chromeTop + padY + (CGFloat(pane.top) - topMost) / paneAreaRows * innerH
+        let width = CGFloat(max(pane.width, 1)) / paneAreaCols * innerW
+        let height = CGFloat(max(pane.height, 1)) / paneAreaRows * innerH
         return CGRect(x: x, y: y, width: width, height: height)
     }
 }
@@ -446,6 +521,8 @@ final class PaneBackgroundUnderlayController: ObservableObject {
             session: manifest.session,
             window: manifest.window,
             windowCells: manifest.windowCells,
+            clientCells: manifest.clientCells,
+            windowPaddingPx: manifest.windowPaddingPx,
             panes: usablePanes
         )
 

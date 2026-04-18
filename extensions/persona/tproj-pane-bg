@@ -2536,6 +2536,28 @@ update_manifest_pane_assets() {
   mv "$tmp_file" "$panes_array_file"
 }
 
+read_ghostty_padding() {
+  # Emits "<x>\t<y>" to stdout. Reads ~/.config/ghostty/config; defaults to 2 when unset.
+  local cfg="${GHOSTTY_CONFIG:-$HOME/.config/ghostty/config}"
+  local px=2 py=2
+  if [[ -f "$cfg" ]]; then
+    local line key val
+    while IFS= read -r line; do
+      [[ "$line" =~ ^[[:space:]]*# ]] && continue
+      [[ "$line" =~ = ]] || continue
+      key="${line%%=*}"; val="${line#*=}"
+      key="${key//[[:space:]]/}"; val="${val//[[:space:]]/}"
+      case "$key" in
+        window-padding-x) px="$val" ;;
+        window-padding-y) py="$val" ;;
+      esac
+    done < "$cfg"
+  fi
+  [[ "$px" =~ ^-?[0-9]+$ ]] || px=2
+  [[ "$py" =~ ^-?[0-9]+$ ]] || py=2
+  printf '%s\t%s\n' "$px" "$py"
+}
+
 write_manifest() {
   local session="$1"
   local manifest_path="$2"
@@ -2544,7 +2566,12 @@ write_manifest() {
   local window_layout="$5"
   local window_width="$6"
   local window_height="$7"
-  local manifest_tmp=""
+  local client_width="${8:-$window_width}"
+  local client_height="${9:-$window_height}"
+  local manifest_tmp="" pad_x="" pad_y="" pad_pair=""
+
+  pad_pair="$(read_ghostty_padding)"
+  IFS=$'\t' read -r pad_x pad_y <<< "$pad_pair"
 
   manifest_tmp="$(mktemp "${manifest_path}.tmp.XXXXXX")"
 
@@ -2558,6 +2585,10 @@ write_manifest() {
     --arg opacity "$DEFAULT_OPACITY" \
     --argjson window_width "$window_width" \
     --argjson window_height "$window_height" \
+    --argjson client_width "$client_width" \
+    --argjson client_height "$client_height" \
+    --argjson pad_x "$pad_x" \
+    --argjson pad_y "$pad_y" \
     --slurpfile panes "$panes_array_file" \
     '{
       version: 1,
@@ -2571,6 +2602,14 @@ write_manifest() {
       window_cells: {
         width: $window_width,
         height: $window_height
+      },
+      client_cells: {
+        width: $client_width,
+        height: $client_height
+      },
+      window_padding_px: {
+        x: $pad_x,
+        y: $pad_y
       },
       panes: $panes[0]
     }' > "$manifest_tmp"
@@ -2595,6 +2634,8 @@ sync_session() {
   local dims=""
   local window_width=""
   local window_height=""
+  local client_width=""
+  local client_height=""
   local window_name=""
   local window_layout=""
   local pane_id=""
@@ -2660,8 +2701,10 @@ sync_session() {
     : > "$panes_jsonl"
     : > "$pending_generate_file"
 
-    dims="$(tmux display-message -p -t "$target" '#{window_width}	#{window_height}	#{window_name}	#{window_layout}')"
-    IFS=$'\t' read -r window_width window_height window_name window_layout <<< "$dims"
+    dims="$(tmux display-message -p -t "$target" '#{window_width}	#{window_height}	#{window_name}	#{window_layout}	#{client_width}	#{client_height}')"
+    IFS=$'\t' read -r window_width window_height window_name window_layout client_width client_height <<< "$dims"
+    [[ -n "${client_width:-}" && "$client_width" =~ ^[0-9]+$ ]] || client_width="$window_width"
+    [[ -n "${client_height:-}" && "$client_height" =~ ^[0-9]+$ ]] || client_height="$window_height"
 
     tmux list-panes -t "$target" -F '#{pane_id}|#{pane_left}|#{pane_top}|#{pane_width}|#{pane_height}|#{pane_current_path}|#{@role}|#{@alias}|#{@column}|#{@project}' > "$pane_rows_file"
 
@@ -2728,7 +2771,7 @@ sync_session() {
     done 3< "$pane_rows_file"
 
     jq -s '.' "$panes_jsonl" > "$panes_array_file"
-    write_manifest "$session" "$manifest_path" "$panes_array_file" "$window_name" "$window_layout" "$window_width" "$window_height"
+    write_manifest "$session" "$manifest_path" "$panes_array_file" "$window_name" "$window_layout" "$window_width" "$window_height" "$client_width" "$client_height"
     tmux set-environment -t "$session" TPROJ_PANE_BG_ENABLE 1
     tmux set-environment -t "$session" TPROJ_PANE_BG_MANIFEST "$manifest_path"
 
@@ -2738,7 +2781,7 @@ sync_session() {
         if generated_image_path="$(generate_background "$pending_project" "$pending_role" "false")"; then
           generated_meta_path="$(project_meta_path "$pending_project" "$pending_role")"
           update_manifest_pane_assets "$panes_array_file" "$pending_pane_id" "$generated_image_path" "$generated_meta_path"
-          write_manifest "$session" "$manifest_path" "$panes_array_file" "$window_name" "$window_layout" "$window_width" "$window_height"
+          write_manifest "$session" "$manifest_path" "$panes_array_file" "$window_name" "$window_layout" "$window_width" "$window_height" "$client_width" "$client_height"
           tmux set-environment -t "$session" TPROJ_PANE_BG_ENABLE 1
           tmux set-environment -t "$session" TPROJ_PANE_BG_MANIFEST "$manifest_path"
         else
