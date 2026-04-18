@@ -139,6 +139,8 @@ tmux ワークスペース内の他 AI ペイン（CC, Cdx, Agent）と通信す
 
 - 送信後は**即 exit**する。応答は `[from:<sender>]` プレフィックスで自動配信される
 - 返信を待つためにポーリングする必要はない。**そのまま作業を続ける**
+- `--new-task` 委任の往復は PostToolUse / UserPromptSubmit hook が自動追跡する（Task ID cache 登録 → `[DONE:]` / `[ACK:]` 検出 → cache 自動削除 → `[inbox-notice]` を次 prompt の context に inject）。詳細は CLAUDE.md §6.3.1 / §8.5.1
+- hook 追跡が効くのは `--new-task` 送信のみ。ID なし送信 or `TPROJ_HOOK_ENABLED` 未設定では CLAUDE.md §8.5.1 の手動 `--read` 運用に従う
 - `--read` はターミナル出力を目視確認するためのツール。受信待ち目的では使わない
 
 **禁止:**
