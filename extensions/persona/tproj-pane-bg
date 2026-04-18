@@ -48,12 +48,13 @@ usage() {
   cat <<'EOF'
 Usage:
   tproj-pane-bg --session <name> [--window <name>] [--mode <single|workspace>]
-  tproj-pane-bg generate --project <path> --role cc|cdx [--refresh]
+  tproj-pane-bg generate --project <path> --role cc|cdx [--prof <value>] [--refresh]
   tproj-pane-bg sync --session <name>
 
 Commands:
   generate   Generate or reuse a cached vertical wallpaper for cc/cdx.
   sync       Collect tmux pane geometry, refresh the manifest, and install hooks.
+  --prof     Override only the persona profession field for image generation.
 EOF
 }
 
@@ -394,6 +395,7 @@ reset_persona_globals() {
   PERSONA_CALLNAME=""
   PERSONA_CHARA=""
   PERSONA_CHARA_HINT=""
+  PERSONA_PROF=""
   PERSONA_VISUAL_AGE=""
   PERSONA_EXPRESSION_MODE=""
   PERSONA_POSE_MODE=""
@@ -756,6 +758,37 @@ persona_chara_costume_prompt_jp() {
   esac
 }
 
+persona_prof_costume_prompt_jp() {
+  [[ -n "$PERSONA_PROF" ]] || return 0
+  case "$PERSONA_PROF" in
+    "巫女") printf '巫女の白衣と緋袴を時代に合わせてアレンジ。神職らしい清潔感と布の流れ' ;;
+    "踊り子") printf '踊り子の軽やかな衣装、布の揺れや装飾が舞のイメージを残す' ;;
+    "薬師") printf '薬草袋や薬瓶を帯び、実用的で知的な衣装。薬師らしい落ち着き' ;;
+    "ナース") printf '看護服を時代に合わせてアレンジ。清潔感と献身的な雰囲気' ;;
+    "メイド") printf '仕える者の清楚な制服。エプロンやヘッドドレスを時代感に馴染ませる' ;;
+    "歌姫") printf '歌姫らしい華やかな衣装。声が似合う開いた胸元と優雅なシルエット' ;;
+    "バーチャルアイドル") printf 'スタジオジブリ風の手描きアニメタッチとやわらかな自然光はそのまま保ちつつ、衣装はバーチャルアイドルのステージ衣装にする。控えめに発光する装飾、透明感のあるステージジャケットやドレス、ヘッドセットマイク、ホログラム素材のアクセサリー。ネオンやサイバー表現は過度にせず、ジブリの落ち着いた色調と線で品良くまとめる。着物・白衣・袴・和装・伝統的な布は一切出さない' ;;
+    "占い師") printf '神秘的な装飾、ベールやショール、星や月のモチーフを纏う' ;;
+    "花魁") printf '豪華な着物と髪飾り、格式の高い遊女らしい艶やかな装い' ;;
+    "女騎士") printf '甲冑と布の組み合わせ、戦う女性の凛々しさと力強さ' ;;
+    "魔女") printf '暗い色調のローブやマント、魔術的な小物、神秘と知性の装い' ;;
+    "剣士") printf '剣帯や革鎧を纏い、戦士としての身軽さと実用性を見せる' ;;
+    "学者") printf '知識人の衣装、書物の気配、整った襟元と几帳面な仕立て' ;;
+    "航海士") printf '航海士の実用衣装、風と潮の痕跡、遠洋に耐える革と布' ;;
+    "鍛冶師") printf '鍛冶師の革前掛けや厚手の袖まくり、火と金属の気配' ;;
+    "僧侶") printf '法衣や袈裟を時代に合わせて、精神的な清浄さと穏やかさ' ;;
+    "諜報員") printf '目立たない仕立ての良い服、隠し道具の気配、鋭い印象' ;;
+    "料理人") printf '料理人の実用衣装、清潔な前掛け、腕まくりの気さくさ' ;;
+    "楽師") printf '楽器を携える衣装、音楽家らしい繊細さと自由な着こなし' ;;
+    "ヴァイオリニスト"|"バイオリニスト") printf 'ヴァイオリンと弓を胸元または肩に自然に携え、弦楽器奏者と一目で分かる佇まい。クラシカルな演奏家らしい端正な衣装、白シャツにベストやジャケットなど品のある弦楽器奏者の装い。ジブリの手描きセル画タッチと落ち着いた色調、やわらかな自然光はそのまま保つ' ;;
+    "ピアニスト") printf '演奏家らしい端正な衣装、長い指先と手元の所作を自然に見せる、コンサートホールを思わせる品のある佇まい。ジブリの手描きセル画タッチと落ち着いた色調はそのまま保つ' ;;
+    "チェリスト") printf 'チェロを携える姿または弓と弦楽器の気配、弦楽器奏者の端正で静かな佇まい。ジブリの手描きセル画タッチと落ち着いた色調はそのまま保つ' ;;
+    "商人") printf '商人らしい上質な仕立て、旅の経験が見える実用的な装い' ;;
+    "錬金術師") printf '実験道具の気配がある衣装、知的で少し風変わりな研究者の装い' ;;
+    *) printf '%sの職業らしい衣装アイテムや小道具が上半身に自然に読み取れる、その職業固有のシルエット。スタジオジブリ風の手描きアニメタッチと落ち着いた色調はそのまま保つ' "$PERSONA_PROF" ;;
+  esac
+}
+
 persona_action_prompt_jp() {
   cat <<EOF
 $(expression_prompt_jp)。$(pose_prompt_jp)。$(motion_prompt_jp)。$(prop_prompt_jp)。$(female_presence_prompt_jp)手の所作か小道具を必ず見せ、静止した無表情の bust にしない。
@@ -843,12 +876,19 @@ set_persona_from_line() {
   tail="${tail# / }"
 
   [[ "$tail" == chara:* ]] || die "unexpected chara format: ${persona_line}"
-  chara_field="$tail"
+  local prof_field=""
+  if [[ "$tail" == *" / prof:"* ]]; then
+    chara_field="${tail%% / prof:*}"
+    prof_field="${tail#*/ prof:}"
+  else
+    chara_field="$tail"
+  fi
 
   PERSONA_CHI_REL="${chi_field#chi-rel:}"
   PERSONA_MASTER_REL="${master_field#master-rel:}"
   PERSONA_CALLNAME="${callname_field#callname:}"
   PERSONA_CHARA="${chara_field#chara:}"
+  PERSONA_PROF="$(trim "$prof_field")"
 
   PERSONA_ERA_HINT="$(describe_era_hint "$PERSONA_ERA")"
   PERSONA_TONE_HINT="$(describe_tone_hint "$PERSONA_TONE")"
@@ -874,7 +914,10 @@ EOF
 
 role_costume_prompt_jp() {
   cat <<EOF
-服装は persona データを最優先に決める。$(persona_silhouette_prompt_jp)。$(persona_era_costume_prompt_jp)。$(persona_master_costume_prompt_jp)。$(persona_chara_costume_prompt_jp)。
+服装は persona データを最優先に決める。$(persona_silhouette_prompt_jp)。$(persona_era_costume_prompt_jp)。$(persona_master_costume_prompt_jp)。$(persona_chara_costume_prompt_jp)。$(
+  local prof_hint; prof_hint="$(persona_prof_costume_prompt_jp)"
+  [[ -n "$prof_hint" ]] && printf '%s。' "$prof_hint"
+)
 かわいさや派手さよりも、役割、性格、時代感、生活感が自然に見えることを優先する。$(
   if [[ "$PERSONA_ROLE" == "cc" && "$PERSONA_GENDER_RAW" == "女" ]]; then
     if [[ "$PERSONA_VISUAL_AGE" == "15-19" ]]; then
@@ -900,6 +943,24 @@ parse_persona_output() {
   printf '%s' "$line"
 }
 
+apply_prof_override() {
+  local persona_line="$1"
+  local prof_override="$2"
+  local trimmed_prof=""
+
+  trimmed_prof="$(trim "$prof_override")"
+  [[ -n "$trimmed_prof" ]] || {
+    printf '%s' "$persona_line"
+    return 0
+  }
+
+  if [[ "$persona_line" == *" / prof:"* ]]; then
+    printf '%s / prof:%s' "${persona_line%% / prof:*}" "$trimmed_prof"
+  else
+    printf '%s / prof:%s' "$persona_line" "$trimmed_prof"
+  fi
+}
+
 build_flash_named_prompt() {
   local role="$1"
   local subject_jp
@@ -909,9 +970,9 @@ build_flash_named_prompt() {
 create an image of a vertical terminal wallpaper.
 Studio Ghibli を強く思わせる、日本の手描き劇場アニメ映画の空気。セル画の人物と背景美術の組み合わせ。やわらかな自然光、落ち着いた色、上品で非オタク的な人物造形。水彩ファンタジー絵本風や海外アニメ風にはしない。
 手順:
-1. 古典的な肖像画のような半身ポートレートにする。顔と上半身が自然に画面の主役として大きく見える、均整の取れた構図にする。頭上の余白を少なくし、胸から上、必要でも腰上までに留める。
+1. 古典的な肖像画のような半身ポートレートにする。顔と上半身が自然に画面の主役として大きく見える、均整の取れた構図にする。頭上の余白を少なくし、胸から上、必要でも腰上までに留める。顔立ちはスタジオジブリの劇場アニメ映画の主役級キャラクターに男女とも寄せる。感情移入できる目元、品のある輪郭、やわらかな表情、手描きセル画の落ち着いた造形。萌え絵・美少年美少女アニメ系・過度な写実・フォトリアル顔は避け、宮崎駿監督作品の主人公のような端正で自然な顔立ちにする。
 2. 人物像は既存の persona データを最優先にする。${subject_jp}として自然に見せる。$(role_character_prompt_jp "$role")
-3. $(role_costume_prompt_jp "$role")
+3. $(role_costume_prompt_jp "$role")。$(persona_prof_costume_prompt_jp)
 4. $(role_scene_prompt_jp "$role")
 5. 服装、姿勢、表情、視線、手元の所作で「このペインはこういう人物だ」と一目で分かるようにする。性別、年代、時代、性格、関係性が、文字に頼らず見えるようにする。
 6. 背景は人物の後ろで静かに支える。背景は personality の補助に徹し、人物が主役で、視線が自然に顔へ集まる構図にする。上端に頭が寄りすぎない。下端に肩が切れすぎない。上下の余白は釣り合いを取る。
@@ -929,9 +990,9 @@ build_flash_fallback_prompt() {
 create an image of a vertical terminal wallpaper.
 Studio Ghibli を強く思わせる、日本の手描き劇場アニメ映画の空気。ただし説明的な模写ではなく、日本アニメ映画らしい顔立ちと線、セル画の人物と背景美術の組み合わせとして出す。やわらかな自然光、落ち着いた色、上品で非オタク的な人物造形。水彩ファンタジー絵本風や海外アニメ風にはしない。
 手順:
-1. 古典的な肖像画のような半身ポートレートにする。顔と上半身が自然に画面の主役として大きく見える、均整の取れた構図にする。頭上の余白を少なくし、胸から上、必要でも腰上までに留める。
+1. 古典的な肖像画のような半身ポートレートにする。顔と上半身が自然に画面の主役として大きく見える、均整の取れた構図にする。頭上の余白を少なくし、胸から上、必要でも腰上までに留める。顔立ちはスタジオジブリの劇場アニメ映画の主役級キャラクターに男女とも寄せる。感情移入できる目元、品のある輪郭、やわらかな表情、手描きセル画の落ち着いた造形。萌え絵・美少年美少女アニメ系・過度な写実・フォトリアル顔は避け、宮崎駿監督作品の主人公のような端正で自然な顔立ちにする。
 2. 人物像は既存の persona データを最優先にする。${subject_jp}として自然に見せる。$(role_character_prompt_jp "$role")
-3. $(role_costume_prompt_jp "$role")
+3. $(role_costume_prompt_jp "$role")。$(persona_prof_costume_prompt_jp)
 4. $(role_scene_prompt_jp "$role")
 5. 服装、姿勢、表情、視線、手元の所作で「このペインはこういう人物だ」と一目で分かるようにする。性別、年代、時代、性格、関係性が、文字に頼らず見えるようにする。
 6. 背景は人物の後ろで静かに支える。背景は personality の補助に徹し、人物が主役で、視線が自然に顔へ集まる構図にする。上端に頭が寄りすぎない。下端に肩が切れすぎない。上下の余白は釣り合いを取る。
@@ -945,6 +1006,9 @@ build_negative_prompt() {
 顔全体の重心が上三分の一へ逃げる構図、頭頂と髪が上端に寄りすぎる構図、上の余白が多すぎて人物が小さく見える構図、顔より下の胴体を入れすぎて人物が間延びする構図、肩が下で切れすぎる構図、人物が小さすぎる構図、背景だけが主役の構図、全身遠景、巨大な目、萌え表現、ちびキャラ、正面ポスター構図、派手なネオン、真っ白背景、過密な装飾は禁止。水彩ファンタジー絵本風、西洋ファンタジー小説の表紙風、海外アニメ風、写実寄りファンタジーイラスト風、コンセプトアート風、油彩風、過度に painterly な筆致は禁止。読める文字、数字、記号、タイトル、字幕、ロゴ、透かし、署名、UI、吹き出し、看板、張り紙、本の題字、背表紙、紙片、ラベル、刻印、数字のある計器は禁止。人物を横倒しにする構図、portrait frame の中で人物を寝かせる構図、canvas を回転させたような sideways composition、説明図のような人工的な印や模様、顔や胴体を壊す不自然な人工物も禁止。 NO READABLE TEXT. NO WORDS. NO LETTERS. NO NUMBERS. NO SYMBOLS. NO SIDEWAYS BODY ORIENTATION. NO ROTATED PORTRAIT SUBJECT. NO FACE PLACED TOO HIGH. NO EXTRA EMPTY SPACE ABOVE THE HEAD. NO SMALL SUBJECT IN A TALL FRAME. NO EXCESS TORSO BELOW THE FACE. NO WATERCOLOR FANTASY BOOK COVER STYLE. NO WESTERN FANTASY PAINTING STYLE. NO REALISTIC DIGITAL PAINTING. NO DIAGRAM-LIKE MARKS. NO ARTIFICIAL SYMBOLS OR SHAPES BREAKING THE FACE OR TORSO.$(
   if [[ "$PERSONA_GENDER_RAW" == "女" ]]; then
     printf ' 女性人物が少年のように見える顔立ち、平坦すぎる子ども体型、男性的すぎる肩幅と直線シルエット、無表情で硬い直立姿勢、中性的すぎて女性と読めない上半身は禁止。 NO BOYISH FEMALE PRESENTATION. NO FLAT CHILDLIKE FEMALE BODY SHAPE. NO OVERLY MASCULINE SHOULDERS ON FEMALE SUBJECT. NO STIFF STRAIGHT POSE FOR FEMALE SUBJECT. NO ANDROGYNOUS FEMALE PRESENTATION.'
+  fi
+  if [[ "$PERSONA_PROF" == *"アイドル"* || "$PERSONA_PROF" == *"歌姫"* || "$PERSONA_PROF" == *"シンガー"* ]]; then
+    printf ' 着物、白衣、袴、和装、緋袴、神職、巫女衣装、伝統的な日本衣装、寺社風の衣装は一切禁止。 NO KIMONO. NO WHITE JINJA ROBE. NO MIKO. NO HAKAMA. NO TRADITIONAL JAPANESE OUTFIT. 過度なネオン演出、サイバーパンクに振り切った派手な彩色、フォトリアル寄りのメタリック光沢、写実的なCG風仕上げは禁止。ジブリ/宮崎駿らしいやわらかな自然光と落ち着いた色調、手描きセル画タッチを崩さない。 NO OVERSATURATED NEON. NO CYBERPUNK STYLE. NO METALLIC CGI GLOSS. KEEP STUDIO GHIBLI HAND-DRAWN CEL ANIMATION STYLE.'
   fi
 )
 EOF
@@ -1055,7 +1119,10 @@ ${subject_jp}。$(visual_age_prompt_jp)。$(gender_presentation_prompt_jp)。${P
 
 $(persona_action_prompt_jp)。
 
-衣装は、$(persona_silhouette_prompt_jp)。$(persona_era_costume_prompt_jp)。$(persona_master_costume_prompt_jp)。$(persona_chara_costume_prompt_jp)。文字、家紋、記章、番号、ロゴは入れない。
+衣装は、$(persona_silhouette_prompt_jp)。$(persona_era_costume_prompt_jp)。$(persona_master_costume_prompt_jp)。$(persona_chara_costume_prompt_jp)。$(
+  local prof_hint; prof_hint="$(persona_prof_costume_prompt_jp)"
+  [[ -n "$prof_hint" ]] && printf '%s。' "$prof_hint"
+)文字、家紋、記章、番号、ロゴは入れない。
 
 背景は、$(persona_scene_prompt_jp)。背景は静かに人物を支え、人物を主役にする。
 
@@ -1093,7 +1160,7 @@ build_pro_prompt_json() {
     --arg pose "$(pose_prompt_jp)" \
     --arg expression "$(expression_prompt_jp)" \
     --arg gaze "$(effective_gaze_jp)" \
-    --arg outfit "$(persona_era_costume_prompt_jp)。$(persona_master_costume_prompt_jp)。$(persona_chara_costume_prompt_jp)" \
+    --arg outfit "$(persona_era_costume_prompt_jp)。$(persona_master_costume_prompt_jp)。$(persona_chara_costume_prompt_jp)。$(persona_prof_costume_prompt_jp)" \
     --arg details "文字や記章のない仕立て。$(visual_age_prompt_jp)" \
     --arg accessories "$(prop_prompt_jp)" \
     --arg location "$(persona_scene_prompt_jp)" \
@@ -2008,6 +2075,7 @@ write_sidecar() {
     --arg callname "$PERSONA_CALLNAME" \
     --arg chara "$PERSONA_CHARA" \
     --arg chara_hint "$PERSONA_CHARA_HINT" \
+    --arg prof "$PERSONA_PROF" \
     --arg effective_gender "$PERSONA_GENDER_RAW" \
     --arg effective_visual_age "$PERSONA_VISUAL_AGE" \
     --arg effective_era "$PERSONA_ERA" \
@@ -2052,7 +2120,8 @@ write_sidecar() {
         master_hint: $master_hint,
         callname: $callname,
         chara: $chara,
-        chara_hint: $chara_hint
+        chara_hint: $chara_hint,
+        prof: $prof
       },
       render_persona: {
         effective_gender: $effective_gender,
@@ -2088,6 +2157,7 @@ generate_background() {
   local project_input="$1"
   local role="$2"
   local refresh_flag="$3"
+  local prof_override="${4:-}"
   local project=""
   local cache_dir=""
   local image_path=""
@@ -2160,6 +2230,7 @@ generate_background() {
     rm -rf "$generation_lock"
     return 1
   fi
+  persona_line="$(apply_prof_override "$persona_line" "$prof_override")"
   set_persona_from_line "$persona_line" "$role"
   gender_desc="$(translate_gender "$PERSONA_GENDER_RAW")"
   age_desc="$(translate_age "$PERSONA_AGE_RAW")"
@@ -2698,6 +2769,7 @@ cmd_generate() {
   local project=""
   local role=""
   local refresh="false"
+  local prof_override=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -2709,6 +2781,11 @@ cmd_generate() {
       --role)
         [[ $# -ge 2 ]] || die "missing value for --role"
         role="$2"
+        shift 2
+        ;;
+      --prof)
+        [[ $# -ge 2 ]] || die "missing value for --prof"
+        prof_override="$2"
         shift 2
         ;;
       --refresh)
@@ -2727,7 +2804,7 @@ cmd_generate() {
 
   [[ -n "$project" ]] || die "generate requires --project"
   [[ "$role" == "cc" || "$role" == "cdx" ]] || die "generate requires --role cc|cdx"
-  generate_background "$project" "$role" "$refresh"
+  generate_background "$project" "$role" "$refresh" "$prof_override"
 }
 
 cmd_sync() {
