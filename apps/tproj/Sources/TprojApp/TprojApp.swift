@@ -270,6 +270,7 @@ private struct PaneBackgroundPane: Identifiable, Decodable, Equatable {
     var height: Int
     var imagePath: String
     var opacity: Double
+    var isActive: Bool
 
     var id: String { paneID }
 
@@ -282,6 +283,7 @@ private struct PaneBackgroundPane: Identifiable, Decodable, Equatable {
         case height
         case imagePath = "image_path"
         case opacity
+        case isActive = "active"
     }
 
     init(from decoder: Decoder) throws {
@@ -294,6 +296,7 @@ private struct PaneBackgroundPane: Identifiable, Decodable, Equatable {
         height = try c.decodeIfPresent(Int.self, forKey: .height) ?? 0
         imagePath = try c.decodeIfPresent(String.self, forKey: .imagePath) ?? ""
         opacity = try c.decodeIfPresent(Double.self, forKey: .opacity) ?? 0.24
+        isActive = try c.decodeIfPresent(Bool.self, forKey: .isActive) ?? false
     }
 }
 
@@ -348,6 +351,7 @@ private struct PaneBackgroundUnderlayView: View {
     private let imageContrast = 0.95
     private let textReadabilityScrim = 0.07
     private let edgeFadePx: CGFloat = 3
+    private let activeTopLineHeight: CGFloat = 4
 
     private var edgeFadeMask: some View {
         VStack(spacing: 0) {
@@ -363,6 +367,26 @@ private struct PaneBackgroundUnderlayView: View {
                 startPoint: .top, endPoint: .bottom
             )
             .frame(height: edgeFadePx)
+        }
+    }
+
+    @ViewBuilder
+    private func activeTopLine(isActive: Bool) -> some View {
+        if isActive {
+            VStack(spacing: 0) {
+                LinearGradient(
+                    gradient: Gradient(colors: [
+                        Color(red: 0.3, green: 0.98, blue: 1.0).opacity(0.95),
+                        Color(red: 0.3, green: 0.98, blue: 1.0).opacity(0.0)
+                    ]),
+                    startPoint: .top, endPoint: .bottom
+                )
+                .frame(height: activeTopLineHeight)
+                .blendMode(.plusLighter)
+                Spacer(minLength: 0)
+            }
+        } else {
+            EmptyView()
         }
     }
 
@@ -385,6 +409,7 @@ private struct PaneBackgroundUnderlayView: View {
                                 Color.black.opacity(textReadabilityScrim)
                             }
                             .mask(edgeFadeMask)
+                            .overlay(activeTopLine(isActive: pane.isActive))
                             .opacity(pane.opacity)
                             .position(x: rect.midX, y: rect.midY)
                     }

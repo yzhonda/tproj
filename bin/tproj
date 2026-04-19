@@ -162,9 +162,9 @@ declare -a GLOBAL_CODEX_ARGS
 TMUX_UI_PANE_BORDER_ACTIVE_FG="colour51"
 TMUX_UI_PANE_BORDER_ACTIVE_BOLD="true"
 TMUX_UI_PANE_BORDER_INACTIVE_FG="colour248"
-TMUX_UI_PANE_TITLE_ACTIVE_PREFIX="▶ "
-TMUX_UI_PANE_TITLE_ACTIVE_FG="colour255"
-TMUX_UI_PANE_TITLE_ACTIVE_BG="colour236"
+TMUX_UI_PANE_TITLE_ACTIVE_PREFIX="▶▶ "
+TMUX_UI_PANE_TITLE_ACTIVE_FG="colour231"
+TMUX_UI_PANE_TITLE_ACTIVE_BG="colour24"
 TMUX_UI_PANE_TITLE_INACTIVE_PREFIX="  "
 TMUX_UI_PANE_TITLE_INACTIVE_FG="colour255"
 TMUX_UI_PANE_TITLE_INACTIVE_BG="colour238"
@@ -177,8 +177,9 @@ TMUX_UI_PANE_TITLE_PREV2_BG="colour237"
 TMUX_UI_PANE_BORDER_PREV3_FG="colour139"
 TMUX_UI_PANE_TITLE_PREV3_FG="colour139"
 TMUX_UI_PANE_TITLE_PREV3_BG="colour237"
-TMUX_UI_WINDOW_TEXT_ACTIVE_FG="default"
+TMUX_UI_WINDOW_TEXT_ACTIVE_FG="colour231"
 TMUX_UI_WINDOW_TEXT_ACTIVE_BG="terminal"
+TMUX_UI_WINDOW_TEXT_ACTIVE_BOLD="true"
 TMUX_UI_WINDOW_TEXT_INACTIVE_FG="colour250"
 TMUX_UI_WINDOW_TEXT_INACTIVE_BG="terminal"
 
@@ -1267,7 +1268,7 @@ parse_global_workspace_config() {
 
 render_tmux_pane_border_format() {
   local active_prefix_style="#[bg=${TMUX_UI_PANE_TITLE_ACTIVE_BG}]#[fg=${TMUX_UI_PANE_BORDER_ACTIVE_FG}]"
-  local active_text_style="#[fg=${TMUX_UI_PANE_TITLE_ACTIVE_FG}]"
+  local active_text_style="#[fg=${TMUX_UI_PANE_TITLE_ACTIVE_FG}]#[bold]"
   local inactive_style="#[bg=${TMUX_UI_PANE_TITLE_INACTIVE_BG}]#[fg=${TMUX_UI_PANE_TITLE_INACTIVE_FG}]"
   local prev1_prefix_style="#[bg=${TMUX_UI_PANE_TITLE_PREV1_BG}]#[fg=${TMUX_UI_PANE_BORDER_PREV1_FG}]"
   local prev1_text_style="#[fg=${TMUX_UI_PANE_TITLE_PREV1_FG}]"
@@ -1316,6 +1317,7 @@ apply_tmux_ui_to_window() {
   local window_style="fg=${TMUX_UI_WINDOW_TEXT_INACTIVE_FG},bg=${TMUX_UI_WINDOW_TEXT_INACTIVE_BG}"
   local window_active_style="fg=${TMUX_UI_WINDOW_TEXT_ACTIVE_FG},bg=${TMUX_UI_WINDOW_TEXT_ACTIVE_BG}"
 
+  [[ "${TMUX_UI_WINDOW_TEXT_ACTIVE_BOLD:-}" == "true" ]] && window_active_style+=",bold"
   [[ "$TMUX_UI_PANE_BORDER_ACTIVE_BOLD" == "true" ]] && active_border_style+=",bold"
   pane_border_format="$(render_tmux_pane_border_format)"
 

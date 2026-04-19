@@ -2344,6 +2344,7 @@ install_sync_hooks() {
     after-resize-pane
     after-resize-window
     after-select-layout
+    after-select-pane
     after-swap-pane
   )
   local full_hooks=(
@@ -2706,9 +2707,9 @@ sync_session() {
     [[ -n "${client_width:-}" && "$client_width" =~ ^[0-9]+$ ]] || client_width="$window_width"
     [[ -n "${client_height:-}" && "$client_height" =~ ^[0-9]+$ ]] || client_height="$window_height"
 
-    tmux list-panes -t "$target" -F '#{pane_id}|#{pane_left}|#{pane_top}|#{pane_width}|#{pane_height}|#{pane_current_path}|#{@role}|#{@alias}|#{@column}|#{@project}' > "$pane_rows_file"
+    tmux list-panes -t "$target" -F '#{pane_id}|#{pane_left}|#{pane_top}|#{pane_width}|#{pane_height}|#{pane_current_path}|#{@role}|#{@alias}|#{@column}|#{@project}|#{pane_active}' > "$pane_rows_file"
 
-    while IFS='|' read -r pane_id pane_left pane_top pane_width pane_height pane_cwd tmux_role pane_alias pane_column project_hint <&3; do
+    while IFS='|' read -r pane_id pane_left pane_top pane_width pane_height pane_cwd tmux_role pane_alias pane_column project_hint pane_active <&3; do
       [[ -n "$pane_id" ]] || continue
       if ! role="$(classify_tmux_role "$tmux_role" 2>/dev/null)"; then
         continue
@@ -2748,6 +2749,7 @@ sync_session() {
         --arg image_path "${image_path:-}" \
         --arg meta_path "${meta_path:-}" \
         --arg opacity "$DEFAULT_OPACITY" \
+        --arg pane_active "${pane_active:-0}" \
         --argjson left "$pane_left" \
         --argjson top "$pane_top" \
         --argjson width "$pane_width" \
@@ -2766,7 +2768,8 @@ sync_session() {
           height: $height,
           image_path: (if $image_path == "" then null else $image_path end),
           image_meta_path: (if $meta_path == "" then null else $meta_path end),
-          opacity: ($opacity | tonumber)
+          opacity: ($opacity | tonumber),
+          active: ($pane_active == "1")
         }' >> "$panes_jsonl"
     done 3< "$pane_rows_file"
 
