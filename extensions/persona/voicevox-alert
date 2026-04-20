@@ -571,19 +571,17 @@ ensure_contextualized_text() {
   local tool_reading="$3"
   local reason="$4"
 
-  if [ -z "$project_spoken" ] || [ -z "$tool_reading" ]; then
-    printf '%s\n' "$text"
-    return 0
-  fi
-
-  if [ -n "$project_spoken" ] && [ -n "$tool_reading" ] && [[ "$text" == *"$project_spoken"* ]] && [[ "$text" == *"$tool_reading"* ]]; then
+  # Accept any non-empty template output as-is. Per plan, short persona-forward
+  # phrases without project/tool name are preferred. Fall back to a generic
+  # contextualized line only when the template produced an empty string.
+  if [ -n "$text" ]; then
     printf '%s\n' "$text"
     return 0
   fi
 
   case "$reason" in
     stop)
-      printf '%s\n' "${project_spoken}の${tool_reading}、とまってます。"
+      printf '%s\n' "${project_spoken}の${tool_reading}、しずかにまってます。"
       ;;
     permission_prompt)
       printf '%s\n' "${project_spoken}の${tool_reading}、きょかまちです。"
