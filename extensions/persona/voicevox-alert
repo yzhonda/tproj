@@ -284,6 +284,7 @@ voice_known_token_spoken() {
     codex) printf 'コーデックス\n' ;;
     creatorradar) printf 'クリエーターレーダー\n' ;;
     firebase) printf 'ファイアベース\n' ;;
+    karaoke) printf 'カラオケ\n' ;;
     monolith) printf 'モノリス\n' ;;
     newcomer) printf 'ニューカマー\n' ;;
     notebooklm) printf 'ノートブックエルエム\n' ;;
