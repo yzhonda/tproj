@@ -2368,6 +2368,14 @@ final class AppViewModel: ObservableObject {
             if result.exitCode == 0 {
                 statusText = "Added column: \(alias)"
                 await loadLiveColumnsAsync()
+                if let projectPath = self.workspaceProjects.first(where: { $0.effectiveAlias == alias })?.path {
+                    let helper = "\(NSHomeDirectory())/bin/voice-identity-sync"
+                    if FileManager.default.isExecutableFile(atPath: helper) {
+                        Task.detached(priority: .background) {
+                            _ = Self.executeCommand(helper, [projectPath, "--alias", alias])
+                        }
+                    }
+                }
             } else {
                 resultTag = "error"
                 note = "alias=\(alias) error=\(trimmedError(result))"

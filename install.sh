@@ -397,16 +397,17 @@ if ! $CORE_ONLY; then
 
   # --- persona ---
   if [[ -d "$SCRIPT_DIR/extensions/persona" ]]; then
-    echo "  persona (project-bootstrap, cc-persona compat, tproj-pane-bg, voicevox-alert)"
+    echo "  persona (project-bootstrap, cc-persona compat, tproj-pane-bg, voicevox-alert, voice-identity-sync)"
     if ! $DRY_RUN; then
-      rm -f ~/bin/project-bootstrap ~/bin/cc-persona ~/bin/tproj-pane-bg ~/bin/voicevox-alert  # remove stale symlinks
+      rm -f ~/bin/project-bootstrap ~/bin/cc-persona ~/bin/tproj-pane-bg ~/bin/voicevox-alert ~/bin/voice-identity-sync  # remove stale symlinks
       cp "$SCRIPT_DIR/extensions/persona/project-bootstrap" ~/bin/
       cp "$SCRIPT_DIR/extensions/persona/cc-persona" ~/bin/
       cp "$SCRIPT_DIR/extensions/persona/tproj-pane-bg" ~/bin/
       cp "$SCRIPT_DIR/extensions/persona/voicevox-alert" ~/bin/
-      chmod +x ~/bin/project-bootstrap ~/bin/cc-persona ~/bin/tproj-pane-bg ~/bin/voicevox-alert
+      cp "$SCRIPT_DIR/extensions/persona/voice-identity-sync" ~/bin/
+      chmod +x ~/bin/project-bootstrap ~/bin/cc-persona ~/bin/tproj-pane-bg ~/bin/voicevox-alert ~/bin/voice-identity-sync
     else
-      echo "    [DRY-RUN] project-bootstrap, cc-persona, tproj-pane-bg, voicevox-alert -> ~/bin/"
+      echo "    [DRY-RUN] project-bootstrap, cc-persona, tproj-pane-bg, voicevox-alert, voice-identity-sync -> ~/bin/"
     fi
     # Check optional deps
     if ! command -v jq &>/dev/null; then

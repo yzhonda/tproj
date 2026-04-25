@@ -1,0 +1,426 @@
+#!/bin/bash
+# voice-identity-sync - patch .cc-status-bar.voice.json identity fields only.
+# Leaves events/defaults/tool_readings untouched. Idempotent. Dictionary-driven.
+#
+# Usage:
+#   voice-identity-sync <project_path>
+#   voice-identity-sync <project_path> --alias <name>
+#   voice-identity-sync <project_path> --force
+#
+# Exits 0 if voice.json missing (defer to project-bootstrap), no diff, or success.
+
+set -eo pipefail
+
+PROJECT_PATH=""
+EXPLICIT_ALIAS=""
+FORCE=0
+QUIET=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --alias) EXPLICIT_ALIAS="$2"; shift 2 ;;
+    --force) FORCE=1; shift ;;
+    --quiet|-q) QUIET=1; shift ;;
+    --help|-h) sed -n '1,12p' "$0"; exit 0 ;;
+    --) shift; break ;;
+    -*) echo "voice-identity-sync: unknown flag: $1" >&2; exit 2 ;;
+    *)
+      if [ -z "$PROJECT_PATH" ]; then
+        PROJECT_PATH="$1"
+      else
+        echo "voice-identity-sync: unexpected arg: $1" >&2; exit 2
+      fi
+      shift ;;
+  esac
+done
+
+[ -n "$PROJECT_PATH" ] || { echo "voice-identity-sync: missing project_path" >&2; exit 2; }
+VOICE_FILE="$PROJECT_PATH/.cc-status-bar.voice.json"
+[ -f "$VOICE_FILE" ] || exit 0
+command -v jq >/dev/null || { echo "voice-identity-sync: jq required" >&2; exit 2; }
+
+log() { [ "$QUIET" = "1" ] || printf '%s\n' "$*" >&2; }
+
+# --- Dictionary functions (mirrors project-bootstrap voice_*_reading family) ---
+voice_letter_reading() {
+  case "$1" in
+    a) echo "エー" ;; b) echo "ビー" ;; c) echo "シー" ;; d) echo "ディー" ;;
+    e) echo "イー" ;; f) echo "エフ" ;; g) echo "ジー" ;; h) echo "エイチ" ;;
+    i) echo "アイ" ;; j) echo "ジェー" ;; k) echo "ケー" ;; l) echo "エル" ;;
+    m) echo "エム" ;; n) echo "エヌ" ;; o) echo "オー" ;; p) echo "ピー" ;;
+    q) echo "キュー" ;; r) echo "アール" ;; s) echo "エス" ;; t) echo "ティー" ;;
+    u) echo "ユー" ;; v) echo "ブイ" ;; w) echo "ダブリュー" ;; x) echo "エックス" ;;
+    y) echo "ワイ" ;; z) echo "ズィー" ;; *) echo "$1" ;;
+  esac
+}
+
+# Mirrors voicevox-alert's voice_known_token_spoken (canonical source).
+# Keep in sync with extensions/persona/voicevox-alert.
+voice_known_token_reading() {
+  case "$1" in
+    # --- abbreviations & project-specific ---
+    ai) echo "エーアイ" ;;
+    ana) echo "アナ" ;;
+    bb) echo "ビービー" ;;
+    cab) echo "シーエービー" ;;
+    cc) echo "シーシー" ;;
+    ccb) echo "シーシービー" ;;
+    ccsb) echo "シーシーエスビー" ;;
+    cli) echo "シーエルアイ" ;;
+    dj) echo "ディージェー" ;;
+    ext) echo "エクスト" ;;
+    gfl) echo "ジーエフエル" ;;
+    gpt) echo "ジーピーティー" ;;
+    ios) echo "アイオーエス" ;;
+    lm) echo "エルエム" ;;
+    mac) echo "マック" ;;
+    mcp) echo "エムシーピー" ;;
+    midi) echo "ミディ" ;;
+    mp) echo "エムピー" ;;
+    mv) echo "エムブイ" ;;
+    nlk) echo "エヌエルケー" ;;
+    np) echo "エヌピー" ;;
+    obs) echo "オービーエス" ;;
+    oc) echo "オーシー" ;;
+    tproj) echo "ティープロジ" ;;
+    tts) echo "ティーティーエス" ;;
+    uadm) echo "ユーアドミン" ;;
+    ui) echo "ユーアイ" ;;
+    url) echo "ユーアールエル" ;;
+    vdr) echo "ブイディーアール" ;;
+    # --- compound project names ---
+    adlogger) echo "アドロガー" ;;
+    aillio) echo "アイリオ" ;;
+    artist) echo "アーティスト" ;;
+    bellman) echo "ベルマン" ;;
+    businessplan) echo "ビジネスプラン" ;;
+    clawgate) echo "クロウゲート" ;;
+    codex) echo "コーデックス" ;;
+    creatorradar) echo "クリエーターレーダー" ;;
+    firebase) echo "ファイアベース" ;;
+    freakout) echo "フリークアウト" ;;
+    karaoke) echo "カラオケ" ;;
+    monolith) echo "モノリス" ;;
+    newcomer) echo "ニューカマー" ;;
+    notebooklm) echo "ノートブックエルエム" ;;
+    oneboard) echo "ワンボード" ;;
+    runtime) echo "ランタイム" ;;
+    statusline) echo "ステータスライン" ;;
+    sunomanual) echo "すのマニュアル" ;;
+    sunoprompt) echo "すのプロンプト" ;;
+    vibeterm) echo "バイブターム" ;;
+    vibelive) echo "バイブライブ" ;;
+    voicelog) echo "ボイスログ" ;;
+    voicevox) echo "ボイスボックス" ;;
+    # --- common English words ---
+    ad) echo "アド" ;;
+    admin) echo "アドミン" ;;
+    agent) echo "エージェント" ;;
+    agents) echo "エージェント" ;;
+    album) echo "アルバム" ;;
+    app) echo "アプリ" ;;
+    azure) echo "アジュール" ;;
+    bar) echo "バー" ;;
+    bell) echo "ベル" ;;
+    board) echo "ボード" ;;
+    book) echo "ブック" ;;
+    bridge) echo "ブリッジ" ;;
+    browser) echo "ブラウザ" ;;
+    build) echo "ビルド" ;;
+    business) echo "ビジネス" ;;
+    chrome) echo "クローム" ;;
+    claude) echo "クロード" ;;
+    claw) echo "クロウ" ;;
+    code) echo "コード" ;;
+    coffee) echo "コーヒー" ;;
+    command) echo "コマンド" ;;
+    commands) echo "コマンド" ;;
+    config) echo "コンフィグ" ;;
+    creator) echo "クリエーター" ;;
+    data) echo "データ" ;;
+    design) echo "デザイン" ;;
+    designer) echo "デザイナー" ;;
+    dev) echo "デヴ" ;;
+    drum) echo "ドラム" ;;
+    engine) echo "エンジン" ;;
+    event) echo "イベント" ;;
+    file) echo "ファイル" ;;
+    fire) echo "ファイア" ;;
+    functions) echo "ファンクション" ;;
+    game) echo "ゲーム" ;;
+    gate) echo "ゲート" ;;
+    general) echo "ジェネラル" ;;
+    gen) echo "ジェン" ;;
+    helper) echo "ヘルパー" ;;
+    honda) echo "ホンダ" ;;
+    image) echo "イメージ" ;;
+    init) echo "イニット" ;;
+    keiri) echo "ケイリ" ;;
+    kit) echo "キット" ;;
+    library) echo "ライブラリ" ;;
+    line) echo "ライン" ;;
+    link) echo "リンク" ;;
+    live) echo "ライブ" ;;
+    log) echo "ログ" ;;
+    logger) echo "ロガー" ;;
+    maker) echo "メーカー" ;;
+    man) echo "マン" ;;
+    manga) echo "マンガ" ;;
+    manual) echo "マニュアル" ;;
+    manuals) echo "マニュアル" ;;
+    master) echo "マスター" ;;
+    meet) echo "ミート" ;;
+    migration) echo "マイグレーション" ;;
+    moderator) echo "モデレーター" ;;
+    monitor) echo "モニター" ;;
+    monkey) echo "モンキー" ;;
+    music) echo "ミュージック" ;;
+    navigator) echo "ナビゲーター" ;;
+    note) echo "ノート" ;;
+    notebook) echo "ノートブック" ;;
+    one) echo "ワン" ;;
+    plan) echo "プラン" ;;
+    player) echo "プレイヤー" ;;
+    plugin) echo "プラグイン" ;;
+    presenter) echo "プレゼンター" ;;
+    project) echo "プロジェクト" ;;
+    prompt) echo "プロンプト" ;;
+    prompter) echo "プロンプター" ;;
+    public) echo "パブリック" ;;
+    radar) echo "レーダー" ;;
+    recall) echo "リコール" ;;
+    release) echo "リリース" ;;
+    rules) echo "ルール" ;;
+    scenario) echo "シナリオ" ;;
+    send) echo "センド" ;;
+    seq) echo "シーケンス" ;;
+    skill) echo "スキル" ;;
+    skills) echo "スキル" ;;
+    slide) echo "スライド" ;;
+    sound) echo "サウンド" ;;
+    speech) echo "スピーチ" ;;
+    status) echo "ステータス" ;;
+    suno) echo "すの" ;;
+    template) echo "テンプレート" ;;
+    vibe) echo "バイブ" ;;
+    video) echo "ビデオ" ;;
+    voice) echo "ボイス" ;;
+    vtuber) echo "ブイチューバー" ;;
+    *) return 1 ;;
+  esac
+}
+
+voice_alpha_token_reading() {
+  local token="$1" lowered reading="" ch
+  lowered="$(printf '%s' "$token" | tr '[:upper:]' '[:lower:]')"
+  if reading="$(voice_known_token_reading "$lowered" 2>/dev/null)"; then
+    printf '%s\n' "$reading"; return 0
+  fi
+  if [[ "$lowered" =~ ^[a-z]+$ ]]; then
+    while [ -n "$lowered" ]; do
+      ch="${lowered:0:1}"
+      lowered="${lowered:1}"
+      reading="${reading}$(voice_letter_reading "$ch")"
+    done
+    printf '%s\n' "$reading"; return 0
+  fi
+  return 1
+}
+
+voice_generic_project_reading() {
+  local project_name="$1" sanitized token reading out=""
+  sanitized="$(printf '%s\n' "$project_name" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/ /g')"
+  for token in $sanitized; do
+    if reading="$(voice_alpha_token_reading "$token" 2>/dev/null)"; then
+      :
+    else
+      reading="$token"
+    fi
+    out="${out}${reading}"
+  done
+  printf '%s\n' "$out"
+}
+
+voice_project_reading() {
+  local project_name="$1"
+  case "$project_name" in
+    "ana") echo "アナ" ;;
+    "oc-general") echo "オーシージェネラル" ;;
+    "tproj") echo "ティープロジ" ;;
+    "aillio") echo "アイリオ" ;;
+    "ailio") echo "アイリオ" ;;
+    "clawgate") echo "クロウゲート" ;;
+    "cc-status-bar") echo "シーシーステータスバー" ;;
+    "vibeterm") echo "バイブターム" ;;
+    "recall") echo "リコール" ;;
+    "statusline") echo "ステータスライン" ;;
+    "chrome-ai-bridge") echo "クロームエーアイブリッジ" ;;
+    "general") echo "ジェネラル" ;;
+    "music") echo "ミュージック" ;;
+    "sunomanual") echo "すのマニュアル" ;;
+    "release") echo "リリース" ;;
+    "openclaw") echo "オープンクロー" ;;
+    *) voice_generic_project_reading "$project_name" ;;
+  esac
+}
+
+voice_project_spoken() { voice_project_reading "$1"; }
+
+voice_project_alias_spoken() {
+  local alias_name="$1"
+  [ -z "$alias_name" ] && { echo ""; return; }
+  voice_generic_project_reading "$alias_name"
+}
+
+resolve_alias_from_workspace() {
+  local project_path="$1"
+  local ws_file="$HOME/.config/tproj/workspace.yaml"
+  [ -f "$ws_file" ] || { echo ""; return; }
+  awk -v target="$project_path" '
+    /^  - path:/ { p=$0; sub(/.*path: *\047?/,"",p); sub(/\047? *$/,"",p) }
+    /alias:/ { a=$0; sub(/.*alias: *\047?/,"",a); sub(/\047? *$/,"",a);
+               if (p==target) { print a; exit } }
+  ' "$ws_file"
+}
+
+# Garbage detection: a value is "garbage" if it leaks raw ASCII letters
+# (e.g., alias "2026nc" passing through unmapped) OR has 4+ consecutive
+# letter-spell tokens.
+LETTER_PATTERN='(エー|ビー|シー|ディー|イー|エフ|ジー|エイチ|アイ|ジェー|ケー|エル|エム|エヌ|オー|ピー|キュー|アール|エス|ティー|ユー|ブイ|ダブリュー|エックス|ワイ|ズィー){4,}'
+is_letter_spell_garbage() {
+  local s="$1"
+  [ -z "$s" ] && return 1
+  if [[ "$s" =~ [a-zA-Z] ]]; then
+    return 0
+  fi
+  printf '%s' "$s" | grep -qE "$LETTER_PATTERN"
+}
+
+# Returns 0 (true) if alias would produce pure letter-spell katakana
+# (no real-word tokens). Used to skip alias_spoken auto-set for short
+# acronym aliases like "mp", "bb", "nlk".
+is_alias_letter_spell() {
+  local alias_name="$1" sanitized token reading lowered ch expected has_real=0
+  sanitized="$(printf '%s\n' "$alias_name" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/ /g')"
+  for token in $sanitized; do
+    [ -z "$token" ] && continue
+    if [[ ! "$token" =~ ^[a-z]+$ ]]; then
+      has_real=1
+      continue
+    fi
+    reading="$(voice_alpha_token_reading "$token" 2>/dev/null)" || continue
+    expected=""
+    lowered="$token"
+    while [ -n "$lowered" ]; do
+      ch="${lowered:0:1}"
+      lowered="${lowered:1}"
+      expected="${expected}$(voice_letter_reading "$ch")"
+    done
+    if [ "$reading" != "$expected" ]; then
+      has_real=1
+    fi
+  done
+  [ "$has_real" = "0" ]
+}
+
+# --- Compute expected values ---
+PROJECT_NAME="$(basename "$PROJECT_PATH")"
+EXPECTED_PROJECT_READING="$(voice_project_reading "$PROJECT_NAME")"
+EXPECTED_PROJECT_SPOKEN="$(voice_project_spoken "$PROJECT_NAME")"
+ALIAS_NAME="${EXPLICIT_ALIAS:-$(resolve_alias_from_workspace "$PROJECT_PATH")}"
+EXPECTED_ALIAS_SPOKEN=""
+ALIAS_IS_LETTER_SPELL=0
+if [ -n "$ALIAS_NAME" ] && [ "$ALIAS_NAME" != "$PROJECT_NAME" ]; then
+  if is_alias_letter_spell "$ALIAS_NAME"; then
+    ALIAS_IS_LETTER_SPELL=1
+  else
+    EXPECTED_ALIAS_SPOKEN="$(voice_project_alias_spoken "$ALIAS_NAME")"
+  fi
+fi
+
+# --- Read current values ---
+CURRENT_PROJECT_NAME="$(jq -r '.identity.project_name // ""' "$VOICE_FILE")"
+CURRENT_PROJECT_READING="$(jq -r '.identity.project_reading // ""' "$VOICE_FILE")"
+CURRENT_PROJECT_SPOKEN="$(jq -r '.identity.project_spoken // ""' "$VOICE_FILE")"
+CURRENT_ALIAS_SPOKEN="$(jq -r '.identity.alias_spoken // ""' "$VOICE_FILE")"
+
+# --- Decide what to update ---
+should_update() {
+  local current="$1" expected="$2"
+  [ -z "$expected" ] && return 1
+  [ "$current" = "$expected" ] && return 1
+  # Regression guard: never overwrite a clean value with letter-spell garbage.
+  if is_letter_spell_garbage "$expected"; then
+    if [ -n "$current" ] && ! is_letter_spell_garbage "$current"; then
+      return 1
+    fi
+  fi
+  if [ "$FORCE" = "1" ]; then return 0; fi
+  [ -z "$current" ] && return 0
+  is_letter_spell_garbage "$current" && return 0
+  return 1
+}
+
+NEW_PROJECT_NAME="$CURRENT_PROJECT_NAME"
+NEW_PROJECT_READING="$CURRENT_PROJECT_READING"
+NEW_PROJECT_SPOKEN="$CURRENT_PROJECT_SPOKEN"
+NEW_ALIAS_SPOKEN="$CURRENT_ALIAS_SPOKEN"
+
+# project_name should always match basename
+if [ "$CURRENT_PROJECT_NAME" != "$PROJECT_NAME" ]; then
+  NEW_PROJECT_NAME="$PROJECT_NAME"
+fi
+
+if should_update "$CURRENT_PROJECT_READING" "$EXPECTED_PROJECT_READING"; then
+  NEW_PROJECT_READING="$EXPECTED_PROJECT_READING"
+fi
+if should_update "$CURRENT_PROJECT_SPOKEN" "$EXPECTED_PROJECT_SPOKEN"; then
+  NEW_PROJECT_SPOKEN="$EXPECTED_PROJECT_SPOKEN"
+fi
+
+# alias_spoken: clear when alias matches project_name OR is pure letter-spell;
+# otherwise apply standard rule. Pure letter-spell aliases (mp, bb, nlk) would
+# override project_spoken with abbreviated readings, which is undesirable.
+if [ -z "$ALIAS_NAME" ] || [ "$ALIAS_NAME" = "$PROJECT_NAME" ] || [ "$ALIAS_IS_LETTER_SPELL" = "1" ]; then
+  if [ "$FORCE" = "1" ] && [ -n "$CURRENT_ALIAS_SPOKEN" ]; then
+    NEW_ALIAS_SPOKEN=""
+  fi
+elif should_update "$CURRENT_ALIAS_SPOKEN" "$EXPECTED_ALIAS_SPOKEN"; then
+  NEW_ALIAS_SPOKEN="$EXPECTED_ALIAS_SPOKEN"
+fi
+
+# Cleanup: alias_spoken should never contain ASCII letters (raw alias leak
+# from incomplete dictionary coverage, e.g., "2026nc"). Clear if detected.
+if [ -n "$NEW_ALIAS_SPOKEN" ] && [[ "$NEW_ALIAS_SPOKEN" =~ [a-zA-Z] ]]; then
+  NEW_ALIAS_SPOKEN=""
+fi
+
+# No-op detection
+if [ "$NEW_PROJECT_NAME" = "$CURRENT_PROJECT_NAME" ] \
+   && [ "$NEW_PROJECT_READING" = "$CURRENT_PROJECT_READING" ] \
+   && [ "$NEW_PROJECT_SPOKEN" = "$CURRENT_PROJECT_SPOKEN" ] \
+   && [ "$NEW_ALIAS_SPOKEN" = "$CURRENT_ALIAS_SPOKEN" ]; then
+  exit 0
+fi
+
+# Atomic patch via jq
+TMP="$(mktemp "${VOICE_FILE}.tmp.XXXXXX")"
+trap 'rm -f "$TMP"' EXIT
+jq \
+  --arg project_name "$NEW_PROJECT_NAME" \
+  --arg project_reading "$NEW_PROJECT_READING" \
+  --arg project_spoken "$NEW_PROJECT_SPOKEN" \
+  --arg alias_spoken "$NEW_ALIAS_SPOKEN" \
+  '.identity.project_name = $project_name
+   | .identity.project_reading = $project_reading
+   | .identity.project_spoken = $project_spoken
+   | .identity.alias_spoken = $alias_spoken' \
+  "$VOICE_FILE" > "$TMP"
+jq empty "$TMP" >/dev/null
+mv "$TMP" "$VOICE_FILE"
+trap - EXIT
+
+log "voice-identity-sync: patched $VOICE_FILE"
+log "  project_name:    ${CURRENT_PROJECT_NAME} -> ${NEW_PROJECT_NAME}"
+log "  project_reading: ${CURRENT_PROJECT_READING} -> ${NEW_PROJECT_READING}"
+log "  project_spoken:  ${CURRENT_PROJECT_SPOKEN} -> ${NEW_PROJECT_SPOKEN}"
+log "  alias_spoken:    ${CURRENT_ALIAS_SPOKEN} -> ${NEW_ALIAS_SPOKEN}"
