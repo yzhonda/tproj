@@ -6,8 +6,10 @@
 #   voice-identity-sync <project_path>
 #   voice-identity-sync <project_path> --alias <name>
 #   voice-identity-sync <project_path> --force
+#   voice-identity-sync <project_path> --alias <name> --ensure
 #
 # Exits 0 if voice.json missing (defer to project-bootstrap), no diff, or success.
+# With --ensure, runs project-bootstrap --prime first when voice.json is missing.
 
 set -eo pipefail
 
@@ -15,12 +17,14 @@ PROJECT_PATH=""
 EXPLICIT_ALIAS=""
 FORCE=0
 QUIET=0
+ENSURE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --alias) EXPLICIT_ALIAS="$2"; shift 2 ;;
     --force) FORCE=1; shift ;;
+    --ensure) ENSURE=1; shift ;;
     --quiet|-q) QUIET=1; shift ;;
-    --help|-h) sed -n '1,12p' "$0"; exit 0 ;;
+    --help|-h) sed -n '1,14p' "$0"; exit 0 ;;
     --) shift; break ;;
     -*) echo "voice-identity-sync: unknown flag: $1" >&2; exit 2 ;;
     *)
@@ -35,8 +39,29 @@ done
 
 [ -n "$PROJECT_PATH" ] || { echo "voice-identity-sync: missing project_path" >&2; exit 2; }
 VOICE_FILE="$PROJECT_PATH/.cc-status-bar.voice.json"
-[ -f "$VOICE_FILE" ] || exit 0
 command -v jq >/dev/null || { echo "voice-identity-sync: jq required" >&2; exit 2; }
+
+# --ensure mode: if voice.json doesn't exist, invoke project-bootstrap --prime
+# to create it before patching. Used by the GUI Add hook so newly added
+# projects get bootstrapped immediately without waiting for SessionStart.
+if [ ! -f "$VOICE_FILE" ]; then
+  if [ "$ENSURE" = "1" ]; then
+    pb=""
+    if [ -x "$HOME/bin/project-bootstrap" ]; then
+      pb="$HOME/bin/project-bootstrap"
+    elif command -v project-bootstrap >/dev/null 2>&1; then
+      pb="$(command -v project-bootstrap)"
+    fi
+    if [ -n "$pb" ]; then
+      if [ -n "$EXPLICIT_ALIAS" ]; then
+        "$pb" --prime "$PROJECT_PATH" --alias "$EXPLICIT_ALIAS" >/dev/null 2>&1 || true
+      else
+        "$pb" --prime "$PROJECT_PATH" >/dev/null 2>&1 || true
+      fi
+    fi
+  fi
+  [ -f "$VOICE_FILE" ] || exit 0
+fi
 
 log() { [ "$QUIET" = "1" ] || printf '%s\n' "$*" >&2; }
 

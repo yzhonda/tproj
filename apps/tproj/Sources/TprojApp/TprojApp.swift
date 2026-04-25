@@ -2372,7 +2372,7 @@ final class AppViewModel: ObservableObject {
                     let helper = "\(NSHomeDirectory())/bin/voice-identity-sync"
                     if FileManager.default.isExecutableFile(atPath: helper) {
                         Task.detached(priority: .background) {
-                            _ = Self.executeCommand(helper, [projectPath, "--alias", alias])
+                            _ = Self.executeCommand(helper, [projectPath, "--alias", alias, "--ensure"])
                         }
                     }
                 }
