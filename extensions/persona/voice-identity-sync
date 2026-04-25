@@ -329,11 +329,24 @@ EXPECTED_PROJECT_SPOKEN="$(voice_project_spoken "$PROJECT_NAME")"
 ALIAS_NAME="${EXPLICIT_ALIAS:-$(resolve_alias_from_workspace "$PROJECT_PATH")}"
 EXPECTED_ALIAS_SPOKEN=""
 ALIAS_IS_LETTER_SPELL=0
+ALIAS_IS_SHORTER=0
 if [ -n "$ALIAS_NAME" ] && [ "$ALIAS_NAME" != "$PROJECT_NAME" ]; then
   if is_alias_letter_spell "$ALIAS_NAME"; then
     ALIAS_IS_LETTER_SPELL=1
   else
     EXPECTED_ALIAS_SPOKEN="$(voice_project_alias_spoken "$ALIAS_NAME")"
+    # Only override project_spoken via alias_spoken when alias yields a
+    # *longer* (more specific) reading than project_spoken. Short aliases
+    # like "suno" -> すの (2) or "businessplan" -> ビジネスプラン (7)
+    # are less specific than the project_spoken (e.g. すのマニュアル/
+    # イニットビジネスプラン), so keep alias_spoken empty and let
+    # project_spoken win at voicevox-alert resolve time.
+    es_len="${#EXPECTED_ALIAS_SPOKEN}"
+    ps_len="${#EXPECTED_PROJECT_SPOKEN}"
+    if [ "$es_len" -lt "$ps_len" ]; then
+      ALIAS_IS_SHORTER=1
+      EXPECTED_ALIAS_SPOKEN=""
+    fi
   fi
 fi
 
@@ -377,10 +390,12 @@ if should_update "$CURRENT_PROJECT_SPOKEN" "$EXPECTED_PROJECT_SPOKEN"; then
   NEW_PROJECT_SPOKEN="$EXPECTED_PROJECT_SPOKEN"
 fi
 
-# alias_spoken: clear when alias matches project_name OR is pure letter-spell;
-# otherwise apply standard rule. Pure letter-spell aliases (mp, bb, nlk) would
-# override project_spoken with abbreviated readings, which is undesirable.
-if [ -z "$ALIAS_NAME" ] || [ "$ALIAS_NAME" = "$PROJECT_NAME" ] || [ "$ALIAS_IS_LETTER_SPELL" = "1" ]; then
+# alias_spoken: clear when alias matches project_name, is pure letter-spell,
+# or yields a *shorter* reading than project_spoken. Otherwise apply standard
+# rule. Pure letter-spell aliases (mp, bb, nlk) would override project_spoken
+# with abbreviated letter readings; shorter real-word aliases (suno,
+# businessplan) drop specificity. Both are undesirable.
+if [ -z "$ALIAS_NAME" ] || [ "$ALIAS_NAME" = "$PROJECT_NAME" ] || [ "$ALIAS_IS_LETTER_SPELL" = "1" ] || [ "$ALIAS_IS_SHORTER" = "1" ]; then
   if [ "$FORCE" = "1" ] && [ -n "$CURRENT_ALIAS_SPOKEN" ]; then
     NEW_ALIAS_SPOKEN=""
   fi
