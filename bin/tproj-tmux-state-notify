@@ -1,0 +1,6 @@
+#!/bin/bash
+set -euo pipefail
+
+STATE_DIR="${TPROJ_STATE_DIR:-$HOME/.config/tproj}"
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+touch "$STATE_DIR/.tmux-state-sentinel" 2>/dev/null || true

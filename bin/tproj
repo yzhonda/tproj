@@ -1345,15 +1345,43 @@ install_pane_focus_hook() {
   tmux set-environment -t "$session" TPROJ_PREV2_BORDER_FG "$TMUX_UI_PANE_BORDER_PREV2_FG" 2>/dev/null || true
   tmux set-environment -t "$session" TPROJ_PREV3_BORDER_FG "$TMUX_UI_PANE_BORDER_PREV3_FG" 2>/dev/null || true
 
-  # Install after-select-pane hook
-  tmux set-hook -t "$session" after-select-pane \
+  # Install after-select-pane hooks in deterministic slots so unindexed
+  # set-hook calls from older code (or third parties) overwriting [0] do
+  # not silently drop our hooks. Slot conventions:
+  #   [10] tproj-pane-bg sync     (registered by tproj-pane-bg itself)
+  #   [20] tproj-pane-focus-hook  (focus rank update / autozoom dispatch)
+  #   [30] tproj-pane-autozoom    (active-pane resize on focus change)
+  tmux set-hook -t "$session" 'after-select-pane[20]' \
     "run-shell '$hook_path #{session_name} #{pane_id}'" 2>/dev/null || true
+
+  local autozoom_path="$HOME/bin/tproj-pane-autozoom"
+  if [[ -x "$autozoom_path" ]]; then
+    tmux set-hook -t "$session" 'after-select-pane[30]' \
+      "run-shell '$autozoom_path #{session_name} >/dev/null 2>&1 || true'" 2>/dev/null || true
+  fi
+
+  local mru_tracker="$HOME/bin/tproj-mru-tracker"
+  if [[ -x "$mru_tracker" ]]; then
+    tmux set-hook -t "$session" 'after-select-pane[40]' \
+      "run-shell '$mru_tracker #{session_name} #{pane_id} >/dev/null 2>&1 || true'" 2>/dev/null || true
+  fi
+
+  local state_notify="$HOME/bin/tproj-tmux-state-notify"
+  if [[ -x "$state_notify" ]]; then
+    tmux set-hook -t "$session" 'after-split-window[50]' \
+      "run-shell '$state_notify >/dev/null 2>&1 || true'" 2>/dev/null || true
+    tmux set-hook -t "$session" 'after-kill-pane[50]' \
+      "run-shell '$state_notify >/dev/null 2>&1 || true'" 2>/dev/null || true
+    tmux set-hook -t "$session" 'pane-died[50]' \
+      "run-shell '$state_notify >/dev/null 2>&1 || true'" 2>/dev/null || true
+  fi
 
   # Install pane-died hook: respawn CC/Cdx panes via respawn-guard (circuit breaker)
   # Only respawn if @role matches claude* or codex*; other panes are left alone.
   local respawn_guard="$HOME/bin/tproj-respawn-guard"
   [[ ! -x "$respawn_guard" ]] && respawn_guard="$SCRIPT_DIR/tproj-respawn-guard"
-  tmux set-hook -t "$session" pane-died \
+  tmux set-hook -u -t "$session" 'pane-died[0]' 2>/dev/null || true
+  tmux set-hook -t "$session" 'pane-died[10]' \
     "if-shell -F '#{m:claude*,#{@role}}' \
        'run-shell \"$respawn_guard #{session_name} #{pane_id} #{@role}\"' \
      'if-shell -F \"#{m:codex*,#{@role}}\" \
@@ -1434,6 +1462,7 @@ sync_tmux_ui_for_live_sessions() {
       apply_tmux_ui_to_window "${session}:${window_name}"
     done < <(tmux list-windows -t "$session" -F '#{window_name}' 2>/dev/null || true)
     install_pane_focus_hook "$session"
+    prime_after_layout_manifest "$session"
     synced=$((synced + 1))
   done
 
@@ -1855,7 +1884,7 @@ create_workspace_layout() {
   local rebalance_cmd
   rebalance_cmd="$(quoted_runtime_bin_path "rebalance-workspace-columns")"
   if [[ -n "$rebalance_cmd" ]]; then
-    tmux set-hook -t "$session" after-kill-pane "run-shell -b '$rebalance_cmd \"$session\"'"
+    tmux set-hook -t "$session" 'after-kill-pane[60]' "run-shell -b '$rebalance_cmd \"$session\"'"
   fi
 
   local first_codex=$(tmux list-panes -t "$session:dev" -F '#{pane_id}' | head -1)

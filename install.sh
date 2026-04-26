@@ -245,7 +245,7 @@ fi
 # ========== 4. Backup & copy ==========
 
 # 4.1 Core scripts
-CORE_BINS=(tproj tproj-drop-column tproj-kill-pane tproj-toggle-yazi tproj-pane-focus-hook tproj-pane-clear-rank tproj-pane-watchdog tproj-respawn-guard tproj-postmortem tproj-mem-trace rebalance-workspace-columns sign-codex wait-for-pane-text)
+CORE_BINS=(tproj tproj-drop-column tproj-kill-pane tproj-toggle-yazi tproj-pane-focus-hook tproj-pane-clear-rank tproj-pane-watchdog tproj-pane-autozoom tproj-tmux-state-notify tproj-mru-tracker tproj-respawn-guard tproj-postmortem tproj-mem-trace rebalance-workspace-columns sign-codex wait-for-pane-text)
 
 if $DRY_RUN; then
   for bin_name in "${CORE_BINS[@]}"; do

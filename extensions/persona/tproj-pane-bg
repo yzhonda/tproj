@@ -2360,11 +2360,17 @@ install_sync_hooks() {
   fast_hook_cmd="'$(single_quote_escape "$SCRIPT_PATH")' sync --session '$(single_quote_escape "$session")' --fast >/dev/null 2>>'$(single_quote_escape "$hook_log")' || true"
   full_hook_cmd="'$(single_quote_escape "$SCRIPT_PATH")' sync --session '$(single_quote_escape "$session")' >/dev/null 2>>'$(single_quote_escape "$hook_log")' || true"
 
+  # Register hooks in deterministic slot [10] so unindexed set-hook calls
+  # from older code (which target slot [0]) cannot overwrite us. Remove only
+  # the stale [0] slot first; unsetting the bare hook name would wipe [20]/[30]
+  # hooks owned by tproj's focus/autozoom stack.
   for hook_name in "${fast_hooks[@]}"; do
-    tmux set-hook -t "$session" "$hook_name" "run-shell -b \"${fast_hook_cmd}\"" >/dev/null 2>&1 || true
+    tmux set-hook -u -t "$session" "${hook_name}[0]" >/dev/null 2>&1 || true
+    tmux set-hook -t "$session" "${hook_name}[10]" "run-shell -b \"${fast_hook_cmd}\"" >/dev/null 2>&1 || true
   done
   for hook_name in "${full_hooks[@]}"; do
-    tmux set-hook -t "$session" "$hook_name" "run-shell -b \"${full_hook_cmd}\"" >/dev/null 2>&1 || true
+    tmux set-hook -u -t "$session" "${hook_name}[0]" >/dev/null 2>&1 || true
+    tmux set-hook -t "$session" "${hook_name}[10]" "run-shell -b \"${full_hook_cmd}\"" >/dev/null 2>&1 || true
   done
 }
 

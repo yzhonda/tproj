@@ -1,0 +1,177 @@
+#!/bin/bash
+# tproj-pane-autozoom - resize active pane and column to dominate the window.
+#
+# Triggered by after-select-pane hook (via tproj-pane-focus-hook) or directly
+# from the GUI toggle. Flag-gated: no-op when the enable flag is absent.
+#
+# Usage:
+#   tproj-pane-autozoom [<session>]   # sync (only acts when flag exists)
+#   tproj-pane-autozoom --enable      # touch flag + sync
+#   tproj-pane-autozoom --disable     # remove flag + restore uniform layout
+#   tproj-pane-autozoom --reset       # restore uniform layout (flag untouched)
+#   tproj-pane-autozoom --status      # print "on" or "off"
+#
+# Flag file: ${TPROJ_STATE_DIR:-$HOME/.config/tproj}/auto-zoom.enabled
+# Min size:  TPROJ_AUTOZOOM_W_MIN (default 120), TPROJ_AUTOZOOM_H_MIN (default 40)
+# Compat:    TPROJ_AUTOZOOM_W_MAX / H_MAX are still accepted as MIN values.
+# Debug:     TPROJ_AUTOZOOM_DEBUG=1 enables /tmp/tproj-pane-autozoom.log
+
+set -euo pipefail
+
+FLAG_DIR="${TPROJ_STATE_DIR:-$HOME/.config/tproj}"
+FLAG="$FLAG_DIR/auto-zoom.enabled"
+TARGET_W="${TPROJ_AUTOZOOM_W_MIN:-${TPROJ_AUTOZOOM_W_MAX:-120}}"
+TARGET_H="${TPROJ_AUTOZOOM_H_MIN:-${TPROJ_AUTOZOOM_H_MAX:-40}}"
+DEBUG_LOG="/tmp/tproj-pane-autozoom.log"
+
+# Always log entry (cheap, helps diagnose hook firing).
+{ echo "[$(date '+%H:%M:%S')] enter args=[$*] pid=$$"; } >> "$DEBUG_LOG" 2>/dev/null || true
+
+dlog() {
+  [ "${TPROJ_AUTOZOOM_DEBUG:-0}" = "1" ] || return 0
+  { echo "[$(date '+%H:%M:%S')]   $*"; } >> "$DEBUG_LOG" 2>/dev/null || true
+}
+
+# Default session: arg1 if non-flag, else env, else tproj-workspace
+default_session() {
+  if [ -n "${TMUX_SESSION:-}" ]; then echo "$TMUX_SESSION"; return; fi
+  echo "tproj-workspace"
+}
+
+# Restore uniform layout: equal column widths + default Codex top ratio (42%).
+# Used by --disable and --reset.
+restore_uniform() {
+  local sess="$1"
+  local rebalance="$HOME/bin/rebalance-workspace-columns"
+  if [ -x "$rebalance" ]; then
+    "$rebalance" "$sess" 2>/dev/null || true
+  fi
+  local win_h target_h
+  win_h=$(tmux display-message -t "$sess" -p '#{window_height}' 2>/dev/null || echo "")
+  [ -z "$win_h" ] && return 0
+  target_h=$(awk -v h="$win_h" 'BEGIN { printf "%d", h*0.42 }')
+  [ "$target_h" -lt 5 ] && target_h=5
+  # Resize each column's top pane (Codex) to default height.
+  tmux list-panes -t "$sess" -F '#{@column} #{pane_top} #{pane_id}' 2>/dev/null \
+    | awk 'NF==3 && $1!="" { if (!(($1) in seen) || $2<seen[$1]) { seen[$1]=$2; rep[$1]=$3 } }
+           END { for (c in rep) print rep[c] }' \
+    | while read -r pid; do
+        [ -n "$pid" ] && tmux resize-pane -t "$pid" -y "$target_h" 2>/dev/null || true
+      done
+}
+
+case "${1:-}" in
+  --enable)
+    mkdir -p "$FLAG_DIR"
+    touch "$FLAG"
+    shift
+    set -- "$(default_session)" "$@"
+    ;;
+  --disable)
+    rm -f "$FLAG"
+    sess="${2:-$(default_session)}"
+    restore_uniform "$sess"
+    exit 0
+    ;;
+  --reset)
+    sess="${2:-$(default_session)}"
+    restore_uniform "$sess"
+    exit 0
+    ;;
+  --status)
+    [ -f "$FLAG" ] && echo "on" || echo "off"
+    exit 0
+    ;;
+  -h|--help)
+    sed -n '2,16p' "$0"
+    exit 0
+    ;;
+  "")
+    set -- "$(default_session)"
+    ;;
+esac
+
+SESSION="${1:-$(default_session)}"
+
+# Flag-gated: no-op when disabled
+[ -f "$FLAG" ] || exit 0
+
+# Verify session exists
+tmux has-session -t "$SESSION" 2>/dev/null || exit 0
+
+# Active pane and its column tag
+ACTIVE=""
+ACTIVE_COL=""
+read -r ACTIVE ACTIVE_COL < <(tmux display-message -t "$SESSION" -p '#{pane_id} #{@column}' 2>/dev/null) || true
+[ -z "$ACTIVE" ] && exit 0
+[ -z "$ACTIVE_COL" ] && exit 0   # @column tag missing => non-multi-project mode
+
+WIN_W=$(tmux display-message -t "$SESSION" -p '#{window_width}' 2>/dev/null || echo "")
+WIN_H=$(tmux display-message -t "$SESSION" -p '#{window_height}' 2>/dev/null || echo "")
+if [ -z "$WIN_W" ] || [ -z "$WIN_H" ]; then
+  exit 0
+fi
+
+# Per-column representative pane (top-most pane: smallest pane_top).
+# resize-pane -x on any pane in a column moves that column boundary.
+COLS=$(tmux list-panes -t "$SESSION" -F '#{@column} #{pane_top} #{pane_id}' 2>/dev/null \
+  | awk 'NF==3 && $1!="" { if (!(($1) in seen) || $2<seen[$1]) { seen[$1]=$2; rep[$1]=$3 } }
+         END { for (c in rep) print c, rep[c] }' \
+  | sort -n)
+
+if [ -z "$COLS" ]; then
+  exit 0
+fi
+
+N_COLS=$(printf '%s\n' "$COLS" | grep -c . || echo 0)
+if [ "$N_COLS" -lt 2 ]; then
+  exit 0
+fi
+
+# Target values are minimum guarantees, not caps. The legacy *_MAX variables
+# are intentionally treated as minimums for compatibility with the first build.
+[ "$TARGET_W" -gt "$WIN_W" ] && TARGET_W=$WIN_W
+[ "$TARGET_H" -gt "$WIN_H" ] && TARGET_H=$WIN_H
+[ "$TARGET_W" -lt 1 ] && TARGET_W=1
+[ "$TARGET_H" -lt 1 ] && TARGET_H=1
+
+# Horizontal sizing: keep the active column at its current width if it is
+# already large enough, but always redistribute the other columns evenly so
+# stale zoom widths from previous active columns do not remain.
+ACTIVE_COL_REP_PANE=""
+while IFS=' ' read -r col rep; do
+  [ "$col" = "$ACTIVE_COL" ] && ACTIVE_COL_REP_PANE="$rep" && break
+done <<EOF_COLS
+$COLS
+EOF_COLS
+[ -z "$ACTIVE_COL_REP_PANE" ] && exit 0
+
+CURRENT_COL_W=$(tmux display-message -t "$ACTIVE_COL_REP_PANE" -p '#{pane_width}' 2>/dev/null || echo 0)
+case "$CURRENT_COL_W" in (*[!0-9]*|"") CURRENT_COL_W=0 ;; esac
+
+NEW_ACTIVE_W=$CURRENT_COL_W
+[ "$CURRENT_COL_W" -lt "$TARGET_W" ] && NEW_ACTIVE_W=$TARGET_W
+
+OTHER_W=$(( (WIN_W - NEW_ACTIVE_W) / (N_COLS - 1) ))
+[ "$OTHER_W" -lt 5 ] && OTHER_W=5
+
+LAST_COL=$(printf '%s\n' "$COLS" | awk 'END {print $1}')
+while IFS=' ' read -r col rep; do
+  [ -z "$col" ] && continue
+  [ "$col" = "$LAST_COL" ] && continue
+  if [ "$col" = "$ACTIVE_COL" ]; then
+    [ "$NEW_ACTIVE_W" != "$CURRENT_COL_W" ] && tmux resize-pane -t "$rep" -x "$NEW_ACTIVE_W" 2>/dev/null || true
+  else
+    tmux resize-pane -t "$rep" -x "$OTHER_W" 2>/dev/null || true
+  fi
+done <<EOF_COLS
+$COLS
+EOF_COLS
+
+CURRENT_ACTIVE_H=$(tmux display-message -t "$ACTIVE" -p '#{pane_height}' 2>/dev/null || echo 0)
+case "$CURRENT_ACTIVE_H" in (*[!0-9]*|"") CURRENT_ACTIVE_H=0 ;; esac
+if [ "$CURRENT_ACTIVE_H" -lt "$TARGET_H" ]; then
+  tmux resize-pane -t "$ACTIVE" -y "$TARGET_H" 2>/dev/null || true
+fi
+
+exit 0

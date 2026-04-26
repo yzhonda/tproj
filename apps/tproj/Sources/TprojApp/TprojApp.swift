@@ -4,6 +4,7 @@ import AppKit
 import CoreMIDI
 import CryptoKit
 import UniformTypeIdentifiers
+import Darwin
 
 extension Notification.Name {
     static let flipSnapSide = Notification.Name("flipSnapSide")
@@ -1114,6 +1115,7 @@ struct WorkspaceProject: Identifiable {
     var host: String
     var alias: String
     var enabled: Bool
+    var lastActiveAt: Int = 0
 
     var effectiveAlias: String {
         if !alias.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -1128,6 +1130,108 @@ struct WorkspaceProject: Identifiable {
         let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return "(no-path)" }
         return URL(fileURLWithPath: trimmed).lastPathComponent
+    }
+}
+
+final class WorkspaceYamlWatcher {
+    private struct WatchEntry {
+        let path: String
+        let fileDescriptor: CInt
+        let source: DispatchSourceFileSystemObject
+    }
+
+    private let paths: [String]
+    private let queue = DispatchQueue(label: "tproj.workspace-yaml-watcher")
+    private let onChange: () -> Void
+    private var entries: [WatchEntry] = []
+    private var debounceWork: DispatchWorkItem?
+
+    init(paths: [String], onChange: @escaping () -> Void) {
+        self.paths = paths
+        self.onChange = onChange
+    }
+
+    func start() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            if !self.entries.isEmpty { return }
+            self.installWatchers()
+        }
+    }
+
+    func cancel() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.debounceWork?.cancel()
+            self.debounceWork = nil
+            for entry in self.entries {
+                entry.source.cancel()
+            }
+            self.entries = []
+        }
+    }
+
+    private func installWatchers() {
+        for watchPath in paths {
+            installWatcher(for: watchPath)
+        }
+    }
+
+    private func installWatcher(for watchPath: String) {
+        let url = URL(fileURLWithPath: watchPath)
+        try? FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        if !FileManager.default.fileExists(atPath: watchPath),
+           url.lastPathComponent == ".tmux-state-sentinel" {
+            FileManager.default.createFile(atPath: watchPath, contents: nil)
+        }
+        guard FileManager.default.fileExists(atPath: watchPath) else { return }
+
+        var fd = open(watchPath, O_EVTONLY)
+        if fd < 0 {
+            fd = open(watchPath, O_RDONLY)
+        }
+        guard fd >= 0 else { return }
+
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: [.write, .delete, .rename],
+            queue: queue
+        )
+        source.setEventHandler { [weak self] in
+            guard let self else { return }
+            let flags = source.data
+            self.scheduleChange()
+            if flags.contains(.delete) || flags.contains(.rename) {
+                self.reinstallWatchers()
+            }
+        }
+        source.setCancelHandler {
+            close(fd)
+        }
+        entries.append(WatchEntry(path: watchPath, fileDescriptor: fd, source: source))
+        source.resume()
+    }
+
+    private func reinstallWatchers() {
+        for entry in entries {
+            entry.source.cancel()
+        }
+        entries = []
+        queue.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            self?.installWatchers()
+        }
+    }
+
+    private func scheduleChange() {
+        debounceWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.onChange()
+        }
+        debounceWork = work
+        queue.asyncAfter(deadline: .now() + 0.3, execute: work)
     }
 }
 
@@ -1643,6 +1747,7 @@ final class AppViewModel: ObservableObject {
     private let monitorStatusPath = "/tmp/tproj-monitor-status.json"
     private let layoutLogPath = "/tmp/tproj-layout-actions.log"
     private var memoryPollTask: Task<Void, Never>?
+    private var workspaceWatcher: WorkspaceYamlWatcher?
 
     // MARK: - PATH & Dependency Resolution
 
@@ -1692,6 +1797,11 @@ final class AppViewModel: ObservableObject {
         return "\(home)/.config/tproj/workspace.yaml"
     }
 
+    private var tmuxStateSentinelPath: String {
+        let home = NSHomeDirectory()
+        return "\(home)/.config/tproj/.tmux-state-sentinel"
+    }
+
     private var bundledRuntimeSeedName: String { "tproj-runtime-seed" }
 
     private var appSupportRootURL: URL {
@@ -1717,7 +1827,14 @@ final class AppViewModel: ObservableObject {
 
     var inactiveProjects: [WorkspaceProject] {
         let livePaths = Set(liveColumns.map { $0.projectPath })
-        return workspaceProjects.filter { !livePaths.contains($0.path) }
+        return workspaceProjects
+            .filter { !livePaths.contains($0.path) }
+            .sorted { lhs, rhs in
+                if lhs.lastActiveAt != rhs.lastActiveAt {
+                    return lhs.lastActiveAt > rhs.lastActiveAt
+                }
+                return lhs.effectiveAlias.localizedCaseInsensitiveCompare(rhs.effectiveAlias) == .orderedAscending
+            }
     }
 
     private struct PaneInfo {
@@ -1928,6 +2045,7 @@ final class AppViewModel: ObservableObject {
             await refreshAll()
             await refreshMemoryStatus()
             startMemoryPolling()
+            startWorkspaceWatcher()
             startMIDIIfNeeded()
 
             if liveColumns.isEmpty {
@@ -1982,8 +2100,26 @@ final class AppViewModel: ObservableObject {
         }
     }
 
+    private func startWorkspaceWatcher() {
+        guard workspaceWatcher == nil else { return }
+        let watcher = WorkspaceYamlWatcher(paths: [workspacePath, tmuxStateSentinelPath]) { [weak self] in
+            Task { @MainActor in
+                await self?.refreshWorkspaceStateFromWatcher()
+            }
+        }
+        workspaceWatcher = watcher
+        watcher.start()
+    }
+
+    private func refreshWorkspaceStateFromWatcher() async {
+        loadWorkspaceProjects()
+        await loadLiveColumnsAsync()
+        normalizeSelection()
+    }
+
     deinit {
         memoryPollTask?.cancel()
+        workspaceWatcher?.cancel()
         midiActivator?.stop()
         startupRetryTask?.cancel()
     }
@@ -3366,7 +3502,7 @@ final class AppViewModel: ObservableObject {
             return
         }
 
-        let query = ".projects[]? | [(.path // \"\"),(.type // \"local\"),(.host // \"\"),(.alias // \"\"),((.enabled // true)|tostring)] | @tsv"
+        let query = ".projects[]? | [(.path // \"\"),(.type // \"local\"),(.host // \"\"),(.alias // \"\"),((.enabled // true)|tostring),((.lastActiveAt // 0)|tostring)] | @tsv"
         let result = runCommand("/usr/bin/env", ["yq", "-r", query, url.path])
 
         guard result.exitCode == 0 else {
@@ -3391,6 +3527,7 @@ final class AppViewModel: ObservableObject {
 
             let enabledRaw = parts[4].lowercased()
             let enabled = enabledRaw == "true"
+            let lastActiveAt = parts.count > 5 ? (Int(parts[5]) ?? 0) : 0
 
             parsed.append(
                 WorkspaceProject(
@@ -3398,12 +3535,18 @@ final class AppViewModel: ObservableObject {
                     type: parts[1].isEmpty ? "local" : parts[1],
                     host: parts[2],
                     alias: parts[3],
-                    enabled: enabled
+                    enabled: enabled,
+                    lastActiveAt: lastActiveAt
                 )
             )
         }
 
-        workspaceProjects = parsed
+        workspaceProjects = parsed.sorted { lhs, rhs in
+            if lhs.lastActiveAt != rhs.lastActiveAt {
+                return lhs.lastActiveAt > rhs.lastActiveAt
+            }
+            return lhs.effectiveAlias.localizedCaseInsensitiveCompare(rhs.effectiveAlias) == .orderedAscending
+        }
     }
 
     private func loadLiveColumns() {
@@ -3773,6 +3916,9 @@ final class AppViewModel: ObservableObject {
             if !project.enabled {
                 lines.append("    enabled: false")
             }
+            if project.lastActiveAt > 0 {
+                lines.append("    lastActiveAt: \(project.lastActiveAt)")
+            }
         }
 
         return lines.joined(separator: "\n") + "\n"
@@ -3785,6 +3931,15 @@ final class AppViewModel: ObservableObject {
 
     private func runCommand(_ launchPath: String, _ arguments: [String], environment: [String: String] = [:]) -> CommandResult {
         Self.executeCommand(launchPath, arguments, environment: environment)
+    }
+
+    func toggleAutoZoom(_ enabled: Bool) {
+        let helper = "\(NSHomeDirectory())/bin/tproj-pane-autozoom"
+        guard FileManager.default.isExecutableFile(atPath: helper) else { return }
+        let arg = enabled ? "--enable" : "--disable"
+        Task.detached(priority: .background) {
+            _ = Self.executeCommand(helper, [arg])
+        }
     }
 
     private func runCommandAsync(_ launchPath: String, _ arguments: [String], environment: [String: String] = [:]) async -> CommandResult {
@@ -4023,6 +4178,8 @@ struct ActionButton: View {
     var body: some View {
         Button(action: action) {
             Text(title)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
                 .frame(maxWidth: expand ? .infinity : nil)
         }
         .buttonStyle(ActionButtonStyle(tone: tone, isHovered: isHovered, isEnabled: isEnabled, dense: dense))
@@ -4208,6 +4365,7 @@ struct ContentView: View {
     @AppStorage("workspaceSectionCollapsed") private var workspaceCollapsed = false
     @AppStorage("memorySectionCollapsed") private var memoryCollapsed = false
     @AppStorage("ccCdxSectionCollapsed") private var ccCdxCollapsed = true
+    @AppStorage("autoZoomEnabled") private var autoZoomEnabled = false
     @State private var draggingColumnID: Int?
     @State private var dropInsertionIndex: Int?
     @State private var isDragActive = false
@@ -4269,15 +4427,17 @@ struct ContentView: View {
                 vm.pendingSessionAction = .stop
             }
             .fixedSize()
-            ActionButton("Sync", tone: .neutral, isEnabled: !vm.isBusy, dense: true) {
-                Task { await vm.syncUIAndRefreshAll() }
-            }
-            .fixedSize()
             ActionButton("Learn", tone: vm.isMIDILearning ? .primary : .neutral, isEnabled: !vm.isBusy, dense: true) {
                 vm.toggleMIDILearn()
             }
             .fixedSize()
+            ActionButton("Zoom", tone: autoZoomEnabled ? .primary : .neutral, isEnabled: !vm.isBusy, dense: true) {
+                autoZoomEnabled.toggle()
+                vm.toggleAutoZoom(autoZoomEnabled)
+            }
+            .frame(width: 38)
         }
+        .padding(.trailing, 2)
     }
 
     @ViewBuilder
@@ -4453,6 +4613,7 @@ struct ContentView: View {
         .preferredColorScheme(.dark)
         .task {
             vm.onAppear()
+            vm.toggleAutoZoom(autoZoomEnabled)
         }
         .onChange(of: vm.isBusy) { busy in
             if !busy, draggingColumnID == nil {

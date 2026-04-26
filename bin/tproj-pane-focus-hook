@@ -19,6 +19,10 @@ set -euo pipefail
 session="$1"
 new_active="$2"
 
+# Auto-zoom (flag-gated): runs on every after-select-pane event, manual or auto.
+# When the enable flag is absent the helper exits immediately.
+"$HOME/bin/tproj-pane-autozoom" "$session" 2>/dev/null || true
+
 # --- auto-focus gate ---
 pending="$(tmux show-environment -t "$session" TPROJ_AUTOFOCUS_PENDING 2>/dev/null | sed 's/^[^=]*=//' || true)"
 
