@@ -13,6 +13,8 @@ set -euo pipefail
 #   tproj-msg --force <target> <message> Send immediately (no idle check, no auto-flush)
 #   tproj-msg --allow-relay <reason> ... One-time override for relay-like send
 #   tproj-msg --allow-fanout <reason> .. One-time override for multi-target fan-out
+#   tproj-msg --allow-chi-retry <reason> ...
+#                                      One-time override for repeated Chi recovery dispatch
 #   tproj-msg --new-task [--ttl <spec>] <target> <message>
 #                                      Send message with Task ID tracking metadata
 #   tproj-msg --list                     List available targets
@@ -40,6 +42,8 @@ set -euo pipefail
 #             Does not enable broadcast targets (all/*/broadcast/everyone).
 #   --allow-fanout <reason>
 #             Allow one multi-target fan-out send of the same message for cc/cdx family.
+#   --allow-chi-retry <reason>
+#             Allow one repeated Chi recovery dispatch that would otherwise be blocked for 24h.
 #   normal    Idle check. If idle: send. If busy/typing: queue. Immediate return.
 #   --read    Read pane output.
 #   --flush   Deliver queued messages to idle targets.
@@ -59,6 +63,8 @@ Usage:
   tproj-msg --force <target> <message> Send immediately (no idle check, no auto-flush)
   tproj-msg --allow-relay <reason> ... One-time override for relay-like send
   tproj-msg --allow-fanout <reason> .. One-time override for multi-target fan-out
+  tproj-msg --allow-chi-retry <reason> ...
+                                      One-time override for repeated Chi recovery dispatch
   tproj-msg --new-task [--ttl <spec>] <target> <message>
                                        Send message with Task ID tracking metadata
   tproj-msg --list                     List available targets
@@ -72,6 +78,7 @@ Usage:
   Note: pane @prompt_state (idle/suggestion/typing/unknown) is used first when available
   Note: broadcast-like targets are forbidden (all, *, broadcast, everyone)
   Note: gate uses session-first tmux lane by default; prefix message with [line-private] for LINE-only lane
+  Note: repeated Chi recovery/proxy dispatch to gate is blocked for 24h unless --allow-chi-retry <reason> is explicit
 
 Target formats:
   cc, cdx           Same column / single mode
@@ -87,6 +94,7 @@ Examples:
   tproj-msg --force cdx "urgent message"
   tproj-msg --allow-relay incident-123 --force tproj.cc "[Control:PSYNC-STOP] ACK"
   tproj-msg --allow-fanout sync-1 tproj.cc "Please review this design"
+  tproj-msg --allow-chi-retry current-user-approved-retry gate "Recover missed LINE id 11"
   tproj-msg --new-task --ttl 45m tproj.cc "Please take Lane D"
   tproj-msg gate "Send via session-first tmux lane"
   tproj-msg gate:session "Send via session tmux lane (explicit)"
@@ -200,6 +208,8 @@ ALLOW_RELAY=false
 ALLOW_RELAY_REASON=""
 ALLOW_FANOUT=false
 ALLOW_FANOUT_REASON=""
+ALLOW_CHI_RETRY=false
+ALLOW_CHI_RETRY_REASON=""
 STDIN_MODE=false
 EXPLICIT_SESSION=""
 EXPLICIT_AS=""
@@ -235,6 +245,14 @@ while [[ $# -gt 0 ]]; do
       [[ $# -lt 1 ]] && { echo "Error: --allow-fanout requires <reason>" >&2; exit 1; }
       ALLOW_FANOUT=true
       ALLOW_FANOUT_REASON="$1"
+      shift
+      ;;
+    --allow-chi-retry)
+      shift
+      [[ $# -lt 1 ]] && { echo "Error: --allow-chi-retry requires <reason>" >&2; exit 1; }
+      [[ -n "$1" ]] || { echo "Error: --allow-chi-retry requires non-empty <reason>" >&2; exit 1; }
+      ALLOW_CHI_RETRY=true
+      ALLOW_CHI_RETRY_REASON="$1"
       shift
       ;;
     --new-task)
@@ -397,6 +415,11 @@ if [[ "$ALLOW_FANOUT" == "true" && ( "$LIST_MODE" == "true" || "$READ_MODE" == "
   exit 1
 fi
 
+if [[ "$ALLOW_CHI_RETRY" == "true" && ( "$LIST_MODE" == "true" || "$READ_MODE" == "true" || "$STATUS_MODE" == "true" || "$VERSION_MODE" == "true" ) ]]; then
+  echo "Error: --allow-chi-retry is only valid for send/flush modes" >&2
+  exit 1
+fi
+
 # === Validate --as usage ===
 if [[ -n "$EXPLICIT_AS" && -z "$EXPLICIT_SESSION" ]]; then
   echo "Error: --as requires --session" >&2
@@ -491,6 +514,9 @@ CONTROL_DEDUP_TTL="$STALE_SECONDS"
 FANOUT_DEDUP_DIR="/tmp/tproj-msg-fanout-dedup"
 FANOUT_DEDUP_FILE="${FANOUT_DEDUP_DIR}/seen.tsv"
 FANOUT_DEDUP_TTL="$STALE_SECONDS"
+CHI_DISPATCH_LEDGER="${TPROJ_MSG_CHI_DISPATCH_LEDGER:-$HOME/.cache/tproj-msg/chi-dispatch.tsv}"
+CHI_DISPATCH_TTL_SEC="${TPROJ_MSG_CHI_DISPATCH_TTL_SEC:-86400}"
+POLICY_DRY_RUN="${TPROJ_MSG_POLICY_DRY_RUN:-false}"
 TMUX_TYPING_GUARD_READ_LINES=120
 TMUX_TYPING_GUARD_SCAN_TAIL_LINES=48
 TMUX_TYPING_GUARD_MAX_PROMPT_DISTANCE_LINES=8
@@ -502,6 +528,7 @@ RELAY_BLOCK_EXIT=13
 BROADCAST_BLOCK_EXIT=14
 FANOUT_BLOCK_EXIT=15
 TYPING_BUSY_EXIT=16
+CHI_RETRY_BLOCK_EXIT=17
 
 # Ensure queue dir exists
 ensure_queue_dir() {
@@ -614,6 +641,107 @@ is_relay_like_message() {
   return 1
 }
 
+is_chi_recovery_dispatch_message() {
+  local msg="$1"
+
+  printf '%s\n' "$msg" | grep -Eiq 'ご主人様からの作業依頼として|扱いにしてください|未達[[:space:]]*LINE|読み落とし扱い' && return 0
+
+  local has_recovery=false
+  local has_dispatch_context=false
+  if printf '%s\n' "$msg" | grep -Eiq '未達|読み落とし|復元|再投入|過去の指示|過去依頼|skip|skipping'; then
+    has_recovery=true
+  fi
+  if printf '%s\n' "$msg" | grep -Eiq 'ご主人様|ユーザー|LINE|id[[:space:]]+[0-9]+|作業依頼|指示|URLだして|日報'; then
+    has_dispatch_context=true
+  fi
+
+  [[ "$has_recovery" == "true" && "$has_dispatch_context" == "true" ]]
+}
+
+ensure_chi_dispatch_ledger() {
+  local dir
+  dir=$(dirname "$CHI_DISPATCH_LEDGER")
+  [[ -d "$dir" ]] || mkdir -p "$dir"
+  [[ -f "$CHI_DISPATCH_LEDGER" ]] || : > "$CHI_DISPATCH_LEDGER"
+}
+
+cleanup_chi_dispatch_ledger() {
+  ensure_chi_dispatch_ledger
+  local now tmp epoch iso target_name fingerprint sender reason age
+  now=$(date +%s)
+  tmp=$(mktemp "$(dirname "$CHI_DISPATCH_LEDGER")/chi-dispatch.XXXXXX")
+
+  while IFS=$'\t' read -r epoch iso target_name fingerprint sender reason; do
+    [[ -z "${epoch:-}" || -z "${fingerprint:-}" ]] && continue
+    [[ "$epoch" =~ ^[0-9]+$ ]] || continue
+    age=$(( now - epoch ))
+    if [[ $age -le $CHI_DISPATCH_TTL_SEC ]]; then
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$epoch" "$iso" "$target_name" "$fingerprint" "$sender" "${reason:-}" >> "$tmp"
+    fi
+  done < "$CHI_DISPATCH_LEDGER"
+
+  mv "$tmp" "$CHI_DISPATCH_LEDGER"
+}
+
+chi_dispatch_sender_label() {
+  printf '%s.%s' "${MY_ALIAS:-unknown}" "${MY_ROLE:-unknown}"
+}
+
+chi_dispatch_fingerprint() {
+  local target_name="$1" msg="$2"
+  local ids quotes raw normalized
+
+  ids=$(printf '%s\n' "$msg" | grep -Eo 'id[[:space:]]+[0-9]+' | tr '\n' ',' | sed 's/,$//' || true)
+  quotes=$(printf '%s\n' "$msg" | grep -Eo '「[^」]{1,160}」' | tr '\n' '|' | sed 's/|$//' || true)
+
+  if [[ -n "$ids" || -n "$quotes" ]]; then
+    raw="$(chi_dispatch_sender_label)|${target_name}|ids=${ids}|quotes=${quotes}"
+  else
+    normalized=$(normalize_message_for_hash "$msg" | sed -E 's/[0-9]{4}-[0-9]{2}-[0-9]{2}T[^ ]+/TIMESTAMP/g; s/[0-9]{4}-[0-9]{2}-[0-9]{2}/DATE/g; s/[0-9]{1,2}:[0-9]{2}(:[0-9]{2})?/TIME/g; s/[Pp][Ii][Dd][=: ]+[0-9]+/pid=PID/g; s/[Cc][Oo][Mm][Mm][Ii][Tt][=: ]+[0-9a-f]{7,40}/commit=HASH/g; s#https?://[^ ]+#URL#g')
+    raw="$(chi_dispatch_sender_label)|${target_name}|${normalized}"
+  fi
+
+  sha1_hash "$raw"
+}
+
+mark_chi_dispatch() {
+  local target_name="$1" fingerprint="$2" reason="$3"
+  local now iso
+  ensure_chi_dispatch_ledger
+  now=$(date +%s)
+  iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$now" "$iso" "$target_name" "$fingerprint" "$(chi_dispatch_sender_label)" "$reason" >> "$CHI_DISPATCH_LEDGER"
+}
+
+enforce_chi_recovery_policy() {
+  local target_name="$1" msg="$2"
+
+  is_gate_target "$target_name" || return 0
+  is_chi_recovery_dispatch_message "$msg" || return 0
+
+  ensure_chi_dispatch_ledger
+  cleanup_chi_dispatch_ledger
+
+  local fingerprint previous prev_iso
+  fingerprint=$(chi_dispatch_fingerprint "$target_name" "$msg")
+  previous=$(awk -F '\t' -v fp="$fingerprint" '$4 == fp { print $2; exit }' "$CHI_DISPATCH_LEDGER" || true)
+
+  if [[ -z "$previous" ]]; then
+    mark_chi_dispatch "$target_name" "$fingerprint" "initial"
+    return 0
+  fi
+
+  prev_iso="$previous"
+  if [[ "$ALLOW_CHI_RETRY" == "true" ]]; then
+    echo "Policy override: allow repeated Chi recovery dispatch to '$target_name' (previous: ${prev_iso}, reason: ${ALLOW_CHI_RETRY_REASON})" >&2
+    mark_chi_dispatch "$target_name" "$fingerprint" "override:${ALLOW_CHI_RETRY_REASON}"
+    return 0
+  fi
+
+  echo "Error: repeated Chi recovery dispatch blocked. Same recovery trigger was sent at ${prev_iso}. Use --allow-chi-retry <reason> only after explicit current user authorization." >&2
+  return "$CHI_RETRY_BLOCK_EXIT"
+}
+
 enforce_send_policy() {
   local target_name="$1" msg="$2"
 
@@ -630,6 +758,12 @@ enforce_send_policy() {
     echo "Error: relay-like message is blocked by policy" >&2
     echo "Hint: add --allow-relay <reason> for one-time explicit override." >&2
     return "$RELAY_BLOCK_EXIT"
+  fi
+
+  if enforce_chi_recovery_policy "$target_name" "$msg"; then
+    :
+  else
+    return "$?"
   fi
 
   return 0
@@ -1939,6 +2073,11 @@ if [[ "$READ_MODE" != "true" ]]; then
     policy_rc=$?
     exit "$policy_rc"
   fi
+fi
+
+if [[ "$POLICY_DRY_RUN" == "1" || "$POLICY_DRY_RUN" == "true" ]]; then
+  echo "Policy dry-run passed for $TARGET" >&2
+  exit 0
 fi
 
 # === Gate target early-exit (bypasses tmux pane resolution) ===
