@@ -13,6 +13,8 @@
 #
 # Flag file: ${TPROJ_STATE_DIR:-$HOME/.config/tproj}/auto-zoom.enabled
 # Min size:  TPROJ_AUTOZOOM_W_MIN (default 120), TPROJ_AUTOZOOM_H_MIN (default 40)
+# Other min: TPROJ_AUTOZOOM_OTHER_MIN (default 40) — cap active so non-active
+#            columns stay at least this wide; small windows skip zoom entirely.
 # Compat:    TPROJ_AUTOZOOM_W_MAX / H_MAX are still accepted as MIN values.
 # Debug:     TPROJ_AUTOZOOM_DEBUG=1 enables /tmp/tproj-pane-autozoom.log
 
@@ -22,6 +24,7 @@ FLAG_DIR="${TPROJ_STATE_DIR:-$HOME/.config/tproj}"
 FLAG="$FLAG_DIR/auto-zoom.enabled"
 TARGET_W="${TPROJ_AUTOZOOM_W_MIN:-${TPROJ_AUTOZOOM_W_MAX:-120}}"
 TARGET_H="${TPROJ_AUTOZOOM_H_MIN:-${TPROJ_AUTOZOOM_H_MAX:-40}}"
+OTHER_MIN_W="${TPROJ_AUTOZOOM_OTHER_MIN:-40}"
 DEBUG_LOG="/tmp/tproj-pane-autozoom.log"
 
 # Always log entry (cheap, helps diagnose hook firing).
@@ -149,12 +152,29 @@ EOF_COLS
 CURRENT_COL_W=$(tmux display-message -t "$ACTIVE_COL_REP_PANE" -p '#{pane_width}' 2>/dev/null || echo 0)
 case "$CURRENT_COL_W" in (*[!0-9]*|"") CURRENT_COL_W=0 ;; esac
 
+# Account for tmux pane borders: each boundary between columns consumes 1 cell,
+# so the actual budget for pane widths is WIN_W - (N_COLS - 1).
+BORDERS=$(( N_COLS - 1 ))
+BUDGET=$(( WIN_W - BORDERS ))
+
+# Cap so non-active columns keep at least OTHER_MIN_W cells (terminal readability).
+# When the window is too small to honor the cap, fall back to uniform layout (no zoom).
+MAX_ACTIVE_ALLOWED=$(( BUDGET - OTHER_MIN_W * BORDERS ))
+if [ "$MAX_ACTIVE_ALLOWED" -lt "$OTHER_MIN_W" ]; then
+  exit 0
+fi
+
 NEW_ACTIVE_W=$CURRENT_COL_W
 [ "$CURRENT_COL_W" -lt "$TARGET_W" ] && NEW_ACTIVE_W=$TARGET_W
+[ "$NEW_ACTIVE_W" -gt "$MAX_ACTIVE_ALLOWED" ] && NEW_ACTIVE_W=$MAX_ACTIVE_ALLOWED
 
-OTHER_W=$(( (WIN_W - NEW_ACTIVE_W) / (N_COLS - 1) ))
-[ "$OTHER_W" -lt 5 ] && OTHER_W=5
+OTHER_W=$(( (BUDGET - NEW_ACTIVE_W) / BORDERS ))
+[ "$OTHER_W" -lt "$OTHER_MIN_W" ] && OTHER_W=$OTHER_MIN_W
 
+# Resize every column except the rightmost (LAST_COL). The last column
+# absorbs the rounding remainder so we get a deterministic layout.
+# With NEW_ACTIVE_W and OTHER_W computed against (BUDGET - borders), the
+# residual width on the last column equals OTHER_W exactly.
 LAST_COL=$(printf '%s\n' "$COLS" | awk 'END {print $1}')
 while IFS=' ' read -r col rep; do
   [ -z "$col" ] && continue
