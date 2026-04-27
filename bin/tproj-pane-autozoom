@@ -12,19 +12,26 @@
 #   tproj-pane-autozoom --status      # print "on" or "off"
 #
 # Flag file: ${TPROJ_STATE_DIR:-$HOME/.config/tproj}/auto-zoom.enabled
-# Min size:  TPROJ_AUTOZOOM_W_MIN (default 120), TPROJ_AUTOZOOM_H_MIN (default 40)
-# Other min: TPROJ_AUTOZOOM_OTHER_MIN (default 40) — cap active so non-active
-#            columns stay at least this wide; small windows skip zoom entirely.
-# Compat:    TPROJ_AUTOZOOM_W_MAX / H_MAX are still accepted as MIN values.
+# Width is derived from the Ghostty window width (W) and the column count (N).
+# - active column = BUDGET * ACTIVE_SHARES / TOTAL_SHARES
+# - other columns = BUDGET / TOTAL_SHARES (each)
+#   where BUDGET = W - (N-1) borders, TOTAL_SHARES = ACTIVE_SHARES + (N-1)
+# Defaults: ACTIVE_SHARES=2 -> active is twice as wide as each other column.
+# Caps:
+# - TPROJ_AUTOZOOM_W_MAX / W_MIN (default 120): upper bound on active width
+# - TPROJ_AUTOZOOM_H_MIN (default 40): minimum active pane height (vertical)
+# Tuning:
+# - TPROJ_AUTOZOOM_ACTIVE_SHARES (default 2): how many "shares" the active
+#   column gets relative to each other column. Active = 2x non-active by default.
 # Debug:     TPROJ_AUTOZOOM_DEBUG=1 enables /tmp/tproj-pane-autozoom.log
 
 set -euo pipefail
 
 FLAG_DIR="${TPROJ_STATE_DIR:-$HOME/.config/tproj}"
 FLAG="$FLAG_DIR/auto-zoom.enabled"
-TARGET_W="${TPROJ_AUTOZOOM_W_MIN:-${TPROJ_AUTOZOOM_W_MAX:-120}}"
+ACTIVE_SHARES="${TPROJ_AUTOZOOM_ACTIVE_SHARES:-2}"
+TARGET_W_CAP="${TPROJ_AUTOZOOM_W_MAX:-${TPROJ_AUTOZOOM_W_MIN:-120}}"
 TARGET_H="${TPROJ_AUTOZOOM_H_MIN:-${TPROJ_AUTOZOOM_H_MAX:-40}}"
-OTHER_MIN_W="${TPROJ_AUTOZOOM_OTHER_MIN:-40}"
 DEBUG_LOG="/tmp/tproj-pane-autozoom.log"
 
 # Always log entry (cheap, helps diagnose hook firing).
@@ -131,12 +138,10 @@ if [ "$N_COLS" -lt 2 ]; then
   exit 0
 fi
 
-# Target values are minimum guarantees, not caps. The legacy *_MAX variables
-# are intentionally treated as minimums for compatibility with the first build.
-[ "$TARGET_W" -gt "$WIN_W" ] && TARGET_W=$WIN_W
+[ "$TARGET_W_CAP" -lt 1 ] && TARGET_W_CAP=1
 [ "$TARGET_H" -gt "$WIN_H" ] && TARGET_H=$WIN_H
-[ "$TARGET_W" -lt 1 ] && TARGET_W=1
 [ "$TARGET_H" -lt 1 ] && TARGET_H=1
+[ "$ACTIVE_SHARES" -lt 1 ] && ACTIVE_SHARES=1
 
 # Horizontal sizing: keep the active column at its current width if it is
 # already large enough, but always redistribute the other columns evenly so
@@ -157,19 +162,23 @@ case "$CURRENT_COL_W" in (*[!0-9]*|"") CURRENT_COL_W=0 ;; esac
 BORDERS=$(( N_COLS - 1 ))
 BUDGET=$(( WIN_W - BORDERS ))
 
-# Cap so non-active columns keep at least OTHER_MIN_W cells (terminal readability).
-# When the window is too small to honor the cap, fall back to uniform layout (no zoom).
-MAX_ACTIVE_ALLOWED=$(( BUDGET - OTHER_MIN_W * BORDERS ))
-if [ "$MAX_ACTIVE_ALLOWED" -lt "$OTHER_MIN_W" ]; then
-  exit 0
+# Share-based proportional split derived purely from window width and column
+# count: active gets ACTIVE_SHARES out of (ACTIVE_SHARES + N - 1) total shares.
+TOTAL_SHARES=$(( ACTIVE_SHARES + BORDERS ))
+NEW_ACTIVE_W=$(( BUDGET * ACTIVE_SHARES / TOTAL_SHARES ))
+OTHER_W=$(( BUDGET / TOTAL_SHARES ))
+
+# Cap active so it doesn't bloat on huge windows. Re-derive other width from
+# the residual so the rightmost column ends up at exactly OTHER_W.
+if [ "$NEW_ACTIVE_W" -gt "$TARGET_W_CAP" ]; then
+  NEW_ACTIVE_W=$TARGET_W_CAP
+  OTHER_W=$(( (BUDGET - NEW_ACTIVE_W) / BORDERS ))
 fi
 
-NEW_ACTIVE_W=$CURRENT_COL_W
-[ "$CURRENT_COL_W" -lt "$TARGET_W" ] && NEW_ACTIVE_W=$TARGET_W
-[ "$NEW_ACTIVE_W" -gt "$MAX_ACTIVE_ALLOWED" ] && NEW_ACTIVE_W=$MAX_ACTIVE_ALLOWED
-
-OTHER_W=$(( (BUDGET - NEW_ACTIVE_W) / BORDERS ))
-[ "$OTHER_W" -lt "$OTHER_MIN_W" ] && OTHER_W=$OTHER_MIN_W
+# Safety: bail if the math degenerates (e.g., negative widths from a tiny window)
+if [ "$NEW_ACTIVE_W" -lt 5 ] || [ "$OTHER_W" -lt 5 ]; then
+  exit 0
+fi
 
 # Resize every column except the rightmost (LAST_COL). The last column
 # absorbs the rounding remainder so we get a deterministic layout.
