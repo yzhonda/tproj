@@ -48,9 +48,12 @@ tt_db_exec_safe() {
   tt_db_guard || return 0
   tt_db_ensure_dirs
   local out rc=0
+  # busy_timeout intentionally short (1000ms): shadow writes happen AFTER the
+  # send-keys delivery, so under rare DB-lock contention we fail-open fast
+  # (drop a history row) rather than hang the user-facing tproj-msg command.
   out=$(sqlite3 -batch -bail "$TPROJ_MSG_DB_PATH" <<SQL 2>>"$TPROJ_MSG_DB_ERROR_LOG"
 .output /dev/null
-PRAGMA busy_timeout=5000;
+PRAGMA busy_timeout=1000;
 PRAGMA foreign_keys=ON;
 .output stdout
 ${sql}
@@ -263,7 +266,7 @@ tt_db_unread_for() {
 PRAGMA busy_timeout=5000;
 .output stdout
 SELECT m.id, m.from_alias, COALESCE(m.task_id,''),
-       replace(replace(substr(m.body,1,200), char(10), ' '), char(13), ' ')
+       replace(replace(replace(substr(m.body,1,200), char(10), ' '), char(13), ' '), char(31), ' ')
   FROM messages m
   JOIN monitor_cursors c ON c.consumer='${consumer}'
  WHERE m.to_alias='${to_alias}'

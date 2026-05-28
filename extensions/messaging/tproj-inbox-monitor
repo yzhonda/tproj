@@ -59,7 +59,7 @@ poll_once() {
 PRAGMA busy_timeout=5000;
 .output stdout
 SELECT m.id, m.from_alias, COALESCE(m.task_id, ''),
-       replace(replace(substr(m.body, 1, 200), char(10), ' '), char(13), ' ')
+       replace(replace(replace(substr(m.body, 1, 200), char(10), ' '), char(13), ' '), char(31), ' ')
   FROM messages m
   JOIN monitor_cursors c ON c.consumer = '${consumer_sql}'
  WHERE m.to_alias = '${to_sql}'
