@@ -138,6 +138,10 @@ HOME_BIN_PATH="$HOME/bin/tproj-msg"
 HOME_BIN_PATH=$(canonicalize_path "$HOME_BIN_PATH" 2>/dev/null || printf '%s' "$HOME_BIN_PATH")
 REPO_BIN_CANDIDATE=$(find_repo_tproj_msg_from_cwd 2>/dev/null || true)
 TASK_CACHE_HELPER="$(dirname "$SELF_PATH")/tproj-task-cache.sh"
+# R1' Stage 3: source cache+DB helpers early so all send paths can shadow-write.
+# Existing --new-task and --read paths also source this; idempotent.
+# Function-only file, no side effects at source time. Fail-open.
+[[ -f "$TASK_CACHE_HELPER" ]] && source "$TASK_CACHE_HELPER" 2>/dev/null || true
 
 if [[ -z "${TPROJ_MSG_REEXECED:-}" ]] && [[ "$SELF_PATH" == "$HOME_BIN_PATH" ]] && [[ -n "${REPO_BIN_CANDIDATE:-}" ]] && [[ "$REPO_BIN_CANDIDATE" != "$SELF_PATH" ]]; then
   echo "Info: stale tproj-msg detected at ~/bin; re-exec -> $REPO_BIN_CANDIDATE" >&2
@@ -1459,6 +1463,13 @@ enqueue() {
   epoch=$(date +%s)
   printf '%s\t%s\t%s\n' "$epoch" "$header" "$msg" >> "${QUEUE_DIR}/${target_name}.queue"
   start_flush_worker
+  # R1' Stage 3 shadow write — record queued state, no delivered_at yet.
+  if declare -F tt_db_log_message >/dev/null 2>&1; then
+    local _hash _from
+    _hash=$(sha1_hash "$msg" 2>/dev/null)
+    _from="${MY_ALIAS:-unknown}.${MY_ROLE:-unknown}"
+    tt_db_log_message "$SESSION" "$_from" "$target_name" "$msg" "$_hash" "$header" "" "outbound" "queued" "${MY_ROLE:-cc}" "tmux" "" >/dev/null 2>&1 || true
+  fi
 }
 
 # Start background flush worker (idempotent, one per queue dir)
@@ -1579,6 +1590,15 @@ flush_queue() {
     sleep 0.3
     ((delivered++)) || true
     echo "  Delivered queued message to $target_name: ${header} ${msg}" >&2
+    # R1' Stage 3 shadow write — flushed delivery, set delivered_at + inbound mirror.
+    if declare -F tt_db_log_message >/dev/null 2>&1; then
+      local _hash _from _outid
+      _hash=$(sha1_hash "$msg" 2>/dev/null)
+      _from="${MY_ALIAS:-unknown}.${MY_ROLE:-unknown}"
+      _outid=$(tt_db_log_message "$SESSION" "$_from" "$target_name" "$msg" "$_hash" "$header" "" "outbound" "flushed" "${MY_ROLE:-cc}" "tmux" "" 2>/dev/null)
+      [[ -n "$_outid" ]] && tt_db_set_delivered "$_outid" 2>/dev/null
+      tt_db_mirror_inbound "$SESSION" "$_from" "$target_name" "$msg" "$_hash" "$header" "" "flushed" "${MY_ROLE:-cc}" "tmux" "" >/dev/null 2>&1 || true
+    fi
   done < "$qfile"
 
   if [[ -n "$kept_lines" ]]; then
@@ -1812,6 +1832,15 @@ send_via_gate() {
     --max-time 10 \
     -d "$payload" 2>&1) || {
     echo "Error: ClawGate unreachable at $bridge_url" >&2
+    # R1' Stage 3 shadow write — curl failure (connection refused / timeout).
+    # Record the unreachable attempt so the DB reflects delivery truth.
+    if declare -F tt_db_log_message >/dev/null 2>&1; then
+      local _hash _from _outid
+      _hash=$(sha1_hash "$msg" 2>/dev/null)
+      _from="${MY_ALIAS:-unknown}.${MY_ROLE:-unknown}"
+      _outid=$(tt_db_log_message "$SESSION" "$_from" "gate:${adapter}" "$msg" "$_hash" "" "" "outbound" "error" "${MY_ROLE:-cc}" "clawgate" "$trace_id" 2>/dev/null)
+      [[ -n "$_outid" ]] && tt_db_set_delivery_error "$_outid" "curl failed: ClawGate unreachable at ${bridge_url}" 2>/dev/null
+    fi
     return 1
   }
 
@@ -1821,9 +1850,26 @@ send_via_gate() {
 
   if [[ "$http_code" =~ ^2 ]]; then
     echo "Sent via gate:${adapter} -> ${bridge_url}${endpoint}" >&2
+    # R1' Stage 3 shadow write — gate delivery (bridge=clawgate, external_id=trace_id).
+    if declare -F tt_db_log_message >/dev/null 2>&1; then
+      local _hash _from _outid
+      _hash=$(sha1_hash "$msg" 2>/dev/null)
+      _from="${MY_ALIAS:-unknown}.${MY_ROLE:-unknown}"
+      _outid=$(tt_db_log_message "$SESSION" "$_from" "gate:${adapter}" "$msg" "$_hash" "" "" "outbound" "gate" "${MY_ROLE:-cc}" "clawgate" "$trace_id" 2>/dev/null)
+      [[ -n "$_outid" ]] && tt_db_set_delivered "$_outid" 2>/dev/null
+    fi
   else
     echo "Error: gate:${adapter} returned HTTP $http_code" >&2
     [[ -n "$body" ]] && echo "  $body" >&2
+    # R1' Stage 3 shadow write — gate error.
+    if declare -F tt_db_log_message >/dev/null 2>&1; then
+      local _hash _from _outid _err
+      _hash=$(sha1_hash "$msg" 2>/dev/null)
+      _from="${MY_ALIAS:-unknown}.${MY_ROLE:-unknown}"
+      _err="HTTP ${http_code}: ${body:0:200}"
+      _outid=$(tt_db_log_message "$SESSION" "$_from" "gate:${adapter}" "$msg" "$_hash" "" "" "outbound" "error" "${MY_ROLE:-cc}" "clawgate" "$trace_id" 2>/dev/null)
+      [[ -n "$_outid" ]] && tt_db_set_delivery_error "$_outid" "$_err" 2>/dev/null
+    fi
     return 1
   fi
 }
@@ -2191,6 +2237,18 @@ if [[ "$READ_MODE" == "true" ]]; then
   FOUND_REPLY=1
   while IFS= read -r reply_id; do
     [[ -n "$reply_id" ]] || continue
+    # R1' Stage 3: determine tag (ACK/DONE/BLOCK/BLOCKED) for this reply_id and
+    # shadow-write the state transition before cache removal. Fail-open.
+    if declare -F tt_db_transition_task >/dev/null 2>&1; then
+      _tag=$(printf '%s\n' "$CAPTURED_OUTPUT" | grep -Eo "\[(ACK|DONE|BLOCK|BLOCKED):[[:space:]]*${reply_id}[[:space:]]*\]" | head -1 | sed -E 's/^\[([A-Z]+):.*$/\1/')
+      case "$_tag" in
+        ACK) _state="acked" ;;
+        DONE) _state="done" ;;
+        BLOCK|BLOCKED) _state="blocked" ;;
+        *) _state="" ;;
+      esac
+      [[ -n "$_state" ]] && tt_db_transition_task "$reply_id" "$_state" 2>/dev/null
+    fi
     tt_cache_remove_task "$TARGET" "$reply_id" >/dev/null 2>&1 || true
     echo "TASK_REPLIED=${reply_id}" >&2
     FOUND_REPLY=0
@@ -2288,6 +2346,15 @@ raw_send() {
   if [[ "$NEW_TASK_MODE" == "true" ]]; then
     TASK_SENT_AT=$(date +%s)
     echo "TASK_ID=${TASK_ID} TASK_TARGET=${TARGET} TASK_TTL_SEC=${TTL_SEC} TASK_SENT_AT=${TASK_SENT_AT}" >&2
+  fi
+  # R1' Stage 3 shadow write — best-effort. outbound + inbound mirror in DB.
+  if declare -F tt_db_log_message >/dev/null 2>&1; then
+    local _hash _from _outid
+    _hash=$(sha1_hash "$MESSAGE" 2>/dev/null)
+    _from="${MY_ALIAS:-unknown}.${MY_ROLE:-unknown}"
+    _outid=$(tt_db_log_message "$SESSION" "$_from" "$TARGET" "$MESSAGE" "$_hash" "$HEADER" "${TASK_ID:-}" "outbound" "send-keys" "${MY_ROLE:-cc}" "tmux" "" 2>/dev/null)
+    [[ -n "$_outid" ]] && tt_db_set_delivered "$_outid" 2>/dev/null
+    tt_db_mirror_inbound "$SESSION" "$_from" "$TARGET" "$MESSAGE" "$_hash" "$HEADER" "${TASK_ID:-}" "send-keys" "${MY_ROLE:-cc}" "tmux" "" >/dev/null 2>&1 || true
   fi
 }
 
