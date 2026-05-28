@@ -370,17 +370,19 @@ if ! $CORE_ONLY; then
       cp "$SCRIPT_DIR/extensions/messaging/tproj-task" ~/bin/
       cp "$SCRIPT_DIR/extensions/messaging/tproj-task-cache.sh" ~/bin/
       cp "$SCRIPT_DIR/extensions/messaging/tproj-msg-db.sh" ~/bin/
+      cp "$SCRIPT_DIR/extensions/messaging/tproj-inbox-monitor" ~/bin/
       chmod +x ~/bin/tproj-msg
       chmod +x ~/bin/tproj-task
       chmod +x ~/bin/tproj-task-cache.sh
       chmod +x ~/bin/tproj-msg-db.sh
+      chmod +x ~/bin/tproj-inbox-monitor
       # Install msg skill for Claude Code and Codex
       mkdir -p "$HOME/.claude/skills/msg" "$HOME/.codex/skills/msg"
       cp "$SCRIPT_DIR/extensions/messaging/skill-msg/SKILL.md" "$HOME/.claude/skills/msg/"
       cp "$SCRIPT_DIR/extensions/messaging/skill-msg/SKILL.md" "$HOME/.codex/skills/msg/"
     else
       echo "    [DRY-RUN] tproj-msg -> ~/bin/"
-      echo "    [DRY-RUN] tproj-task, tproj-task-cache.sh, tproj-msg-db.sh -> ~/bin/"
+      echo "    [DRY-RUN] tproj-task, tproj-task-cache.sh, tproj-msg-db.sh, tproj-inbox-monitor -> ~/bin/"
       echo "    [DRY-RUN] msg skill -> ~/.claude/skills/ + ~/.codex/skills/"
     fi
   fi

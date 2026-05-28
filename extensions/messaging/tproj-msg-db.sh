@@ -262,7 +262,8 @@ tt_db_unread_for() {
 .output /dev/null
 PRAGMA busy_timeout=5000;
 .output stdout
-SELECT m.id, m.from_alias, COALESCE(m.task_id,''), substr(m.body,1,200)
+SELECT m.id, m.from_alias, COALESCE(m.task_id,''),
+       replace(replace(substr(m.body,1,200), char(10), ' '), char(13), ' ')
   FROM messages m
   JOIN monitor_cursors c ON c.consumer='${consumer}'
  WHERE m.to_alias='${to_alias}'

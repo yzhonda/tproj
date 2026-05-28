@@ -1832,6 +1832,15 @@ send_via_gate() {
     --max-time 10 \
     -d "$payload" 2>&1) || {
     echo "Error: ClawGate unreachable at $bridge_url" >&2
+    # R1' Stage 3 shadow write — curl failure (connection refused / timeout).
+    # Record the unreachable attempt so the DB reflects delivery truth.
+    if declare -F tt_db_log_message >/dev/null 2>&1; then
+      local _hash _from _outid
+      _hash=$(sha1_hash "$msg" 2>/dev/null)
+      _from="${MY_ALIAS:-unknown}.${MY_ROLE:-unknown}"
+      _outid=$(tt_db_log_message "$SESSION" "$_from" "gate:${adapter}" "$msg" "$_hash" "" "" "outbound" "error" "${MY_ROLE:-cc}" "clawgate" "$trace_id" 2>/dev/null)
+      [[ -n "$_outid" ]] && tt_db_set_delivery_error "$_outid" "curl failed: ClawGate unreachable at ${bridge_url}" 2>/dev/null
+    fi
     return 1
   }
 

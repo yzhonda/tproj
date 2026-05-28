@@ -58,7 +58,8 @@ poll_once() {
 .output /dev/null
 PRAGMA busy_timeout=5000;
 .output stdout
-SELECT m.id, m.from_alias, COALESCE(m.task_id, ''), substr(m.body, 1, 200)
+SELECT m.id, m.from_alias, COALESCE(m.task_id, ''),
+       replace(replace(substr(m.body, 1, 200), char(10), ' '), char(13), ' ')
   FROM messages m
   JOIN monitor_cursors c ON c.consumer = '${consumer_sql}'
  WHERE m.to_alias = '${to_sql}'
@@ -74,7 +75,10 @@ SQL
 
   last_id=""
   while IFS=$'\x1f' read -r mid from tid body; do
-    [[ -z "$mid" ]] && continue
+    # Numeric guard: skip any physical line whose first field is not a row id.
+    # Defends against a stray newline in body slipping a non-numeric token into
+    # the mid position (belt-and-suspenders; SELECT already strips \n/\r).
+    [[ "$mid" =~ ^[0-9]+$ ]] || continue
     local task_label="${tid:-none}"
     # Stdout = notification. Trailing newline implicit.
     printf '[inbox-notice] from=%s task=%s body="%s" (msg_id=%s)\n' \
