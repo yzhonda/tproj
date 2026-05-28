@@ -257,7 +257,8 @@ tt_db_unread_for() {
   local limit="${3:-50}"
   [[ -z "$consumer" || -z "$to_alias" ]] && return 0
   tt_db_exec_safe "INSERT OR IGNORE INTO monitor_cursors(consumer, last_message_id, updated_at) VALUES ('${consumer}', COALESCE((SELECT MAX(id) FROM messages),0), strftime('%s','now'));" >/dev/null
-  sqlite3 -batch -bail -separator $'\t' "$TPROJ_MSG_DB_PATH" <<SQL 2>>"$TPROJ_MSG_DB_ERROR_LOG" || true
+  # Use \x1f (non-whitespace) so bash IFS won't collapse empty fields.
+  sqlite3 -batch -bail -separator $'\x1f' "$TPROJ_MSG_DB_PATH" <<SQL 2>>"$TPROJ_MSG_DB_ERROR_LOG" || true
 .output /dev/null
 PRAGMA busy_timeout=5000;
 .output stdout

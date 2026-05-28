@@ -1,0 +1,108 @@
+#!/bin/bash
+# tproj-inbox-monitor — CC-side SQLite tail for tproj-msg inbound notifications.
+#
+# Designed to be invoked by Claude Code's Monitor tool:
+#   Monitor(command="tproj-inbox-monitor", persistent=true)
+#
+# Each stdout line is one in-context notification. We poll the messages table
+# every 5s (configurable) for new inbound rows targeted at the current pane
+# that have not yet been read or notified, and emit a single [inbox-notice]
+# line per row before advancing the monitor cursor.
+#
+# Fail-open: DB missing or sqlite3 absent => sleep and retry instead of
+# crashing the Monitor.
+
+set -u
+
+DB="${TPROJ_MSG_DB_PATH:-$HOME/.local/share/tproj-msg/messages.db}"
+SESSION="${TMUX_SESSION:-$(tmux display-message -p '#S' 2>/dev/null || echo unknown)}"
+MY_ALIAS="${TPROJ_MONITOR_ALIAS:-$(tmux display-message -p '#{@alias}' 2>/dev/null || echo unknown)}"
+MY_ROLE="${TPROJ_MONITOR_ROLE:-cc}"
+CONSUMER="${SESSION}:${MY_ALIAS}.${MY_ROLE}"
+TO_ALIAS="${MY_ALIAS}.${MY_ROLE}"
+POLL="${TPROJ_MONITOR_POLL_SEC:-5}"
+RETRY_SLEEP="${TPROJ_MONITOR_RETRY_SEC:-60}"
+
+# Escape single quotes for inline SQL (SQLite literal). Same convention as
+# tproj-msg-db.sh tt_db_quote.
+sql_quote() {
+  printf '%s' "$1" | sed "s/'/''/g"
+}
+
+require_db() {
+  command -v sqlite3 >/dev/null 2>&1 || return 1
+  [[ -r "$DB" ]]
+}
+
+bootstrap_cursor() {
+  local consumer_sql
+  consumer_sql=$(sql_quote "$CONSUMER")
+  sqlite3 -bail "$DB" <<SQL 2>/dev/null
+.output /dev/null
+PRAGMA busy_timeout=5000;
+.output stdout
+INSERT OR IGNORE INTO monitor_cursors(consumer, last_message_id, updated_at)
+VALUES ('${consumer_sql}', COALESCE((SELECT MAX(id) FROM messages), 0), strftime('%s','now'));
+SQL
+}
+
+poll_once() {
+  local consumer_sql to_sql
+  consumer_sql=$(sql_quote "$CONSUMER")
+  to_sql=$(sql_quote "$TO_ALIAS")
+  local rows last_id mid from tid body
+  # \x1f (ASCII Unit Separator) is non-whitespace, so bash IFS treats consecutive
+  # delimiters as distinct empty fields (unlike $'\t' which is whitespace-IFS
+  # and collapses runs).
+  rows=$(sqlite3 -separator $'\x1f' "$DB" <<SQL 2>/dev/null
+.output /dev/null
+PRAGMA busy_timeout=5000;
+.output stdout
+SELECT m.id, m.from_alias, COALESCE(m.task_id, ''), substr(m.body, 1, 200)
+  FROM messages m
+  JOIN monitor_cursors c ON c.consumer = '${consumer_sql}'
+ WHERE m.to_alias = '${to_sql}'
+   AND m.id > c.last_message_id
+   AND m.direction = 'inbound'
+   AND m.read_at IS NULL
+   AND m.notified_at IS NULL
+ ORDER BY m.id ASC
+ LIMIT 50;
+SQL
+) || rows=""
+  [[ -z "$rows" ]] && return 0
+
+  last_id=""
+  while IFS=$'\x1f' read -r mid from tid body; do
+    [[ -z "$mid" ]] && continue
+    local task_label="${tid:-none}"
+    # Stdout = notification. Trailing newline implicit.
+    printf '[inbox-notice] from=%s task=%s body="%s" (msg_id=%s)\n' \
+      "$from" "$task_label" "$body" "$mid"
+    last_id="$mid"
+    sqlite3 -bail "$DB" "UPDATE messages SET read_at=strftime('%s','now') WHERE id=${mid};" 2>/dev/null
+  done <<< "$rows"
+
+  if [[ -n "$last_id" ]]; then
+    sqlite3 -bail "$DB" "UPDATE monitor_cursors SET last_message_id=${last_id}, updated_at=strftime('%s','now') WHERE consumer='${consumer_sql}';" 2>/dev/null
+  fi
+}
+
+main() {
+  # Bootstrap or wait for DB.
+  while ! require_db; do
+    sleep "$RETRY_SLEEP"
+  done
+  bootstrap_cursor
+
+  while true; do
+    if require_db; then
+      poll_once
+      sleep "$POLL"
+    else
+      sleep "$RETRY_SLEEP"
+    fi
+  done
+}
+
+main "$@"
